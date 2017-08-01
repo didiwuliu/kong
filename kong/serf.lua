@@ -7,13 +7,16 @@ local pl_file = require "pl.file"
 local cjson = require "cjson.safe"
 local log = require "kong.cmd.utils.log"
 
+local ngx_log = ngx.log
+local DEBUG = ngx.DEBUG
+
 local Serf = {}
 Serf.__index = Serf
 
 Serf.args_mt = {
   __tostring = function(t)
     local buf = {}
-    for k, v in pairs(t) do buf[#buf+1] = k.." '"..v.."'" end
+    for k, v in pairs(t) do buf[#buf+1] = k .. " '" .. v .. "'" end
     return table.concat(buf, " ")
   end
 }
@@ -28,17 +31,20 @@ end
 
 -- WARN: BAD, this is **blocking** IO. Legacy code from previous Serf
 -- implementation that needs to be upgraded.
-function Serf:invoke_signal(signal, args, no_rpc)
+function Serf:invoke_signal(signal, args, no_rpc, full_error)
   args = args or {}
   if type(args) == "table" then
     setmetatable(args, Serf.args_mt)
   end
-  local rpc = no_rpc and "" or "-rpc-addr="..self.config.cluster_listen_rpc
+  local rpc = no_rpc and "" or "-rpc-addr=" .. self.config.cluster_listen_rpc
   local cmd = string.format("%s %s %s %s", self.config.serf_path, signal, rpc, tostring(args))
+  ngx_log(DEBUG, "[serf] running command: ", cmd)
   local ok, code, stdout, stderr = pl_utils.executeex(cmd)
   if not ok or code ~= 0 then
-    -- always print the first error line of serf
-    local err = stdout ~= "" and pl_stringx.splitlines(stdout)[1] or stderr
+    local err = stderr
+    if stdout ~= "" then
+      err = full_error and stdout or pl_stringx.splitlines(stdout)[1]
+    end
     return nil, err
   end
 
@@ -55,25 +61,48 @@ function Serf:leave()
   -- fixed we can check again for any errors returned by the following command.
   self:invoke_signal("leave")
 
-  local _, err = self.dao.nodes:delete {name = self.node_name}
-  if err then return nil, tostring(err) end
+  -- This check is required in case the prefix preparation fails befofe a node
+  -- id can be generated. In that case this value will be nil and the DAO will
+  -- fail because the primary key is missing in the delete operation.
+  if self.node_name then
+    local _, err = self.dao.nodes:delete {name = self.node_name}
+    if err then
+      return nil, tostring(err)
+    end
+  end
 
   return true
 end
 
 function Serf:force_leave(node_name)
   local res, err = self:invoke_signal("force-leave", node_name)
-  if not res then return nil, err end
+  if not res then
+    return nil, err
+  end
 
   return true
 end
 
+function Serf:keys(action, key)
+  local res, err = self:invoke_signal(string.format("keys %s %s", action, key 
+                                              and key or ""), nil, false, true)
+  if not res then
+    return nil, err
+  end
+
+  return res
+end
+
 function Serf:members()
   local res, err = self:invoke_signal("members", {["-format"] = "json"})
-  if not res then return nil, err end
+  if not res then
+    return nil, err
+  end
 
   local json, err = cjson.decode(res)
-  if not json then return nil, err end
+  if not json then
+    return nil, err
+  end
 
   return json.members
 end
@@ -90,7 +119,9 @@ function Serf:cleanup()
   -- Delete current node just in case it was there
   -- (due to an inconsistency caused by a crash)
   local _, err = self.dao.nodes:delete {name = self.node_name }
-  if err then return nil, tostring(err) end
+  if err then
+    return nil, tostring(err)
+  end
 
   return true
 end
@@ -111,7 +142,7 @@ function Serf:autojoin()
         joined = true
         break
       else
-        log.warn("could not join cluster at %s, if the node does not exist "..
+        log.warn("could not join cluster at %s, if the node does not exist " ..
                  "anymore it will be purged automatically", v.cluster_listening_address)
       end
     end
@@ -125,7 +156,9 @@ end
 
 function Serf:add_node()
   local members, err = self:members()
-  if not members then return nil, err end
+  if not members then
+    return nil, err
+  end
 
   local addr
   for _, member in ipairs(members) do
@@ -143,21 +176,25 @@ function Serf:add_node()
     name = self.node_name,
     cluster_listening_address = pl_stringx.strip(addr)
   }, {ttl = self.config.cluster_ttl_on_failure})
-  if err then return nil, tostring(err) end
+  if err then
+    return nil, tostring(err)
+  end
 
   return true
 end
 
 function Serf:event(t_payload)
   local payload, err = cjson.encode(t_payload)
-  if not payload then return nil, err end
+  if not payload then
+    return nil, err
+  end
 
   if #payload > 512 then
     -- Serf can't send a payload greater than 512 bytes
-    return nil, "encoded payload is "..#payload.." and exceeds the limit of 512 bytes!"
+    return nil, "encoded payload is " .. #payload .. " and exceeds the limit of 512 bytes!"
   end
 
-  return self:invoke_signal("event -coalesce=false", " kong '"..payload.."'")
+  return self:invoke_signal("event -coalesce=false", " kong '" .. payload .. "'")
 end
 
 return Serf

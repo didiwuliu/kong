@@ -1,5 +1,4 @@
 local cjson = require "cjson"
-local cache = require "kong.tools.database_cache"
 local helpers = require "spec.helpers"
 local pl_tablex = require "pl.tablex"
 local pl_stringx = require "pl.stringx"
@@ -10,30 +9,36 @@ local NODES_CONF = {}
 local NODES = {
   servroot1 = {
     prefix = "servroot1",
+    ssl = false,
+    admin_ssl = false,
     proxy_listen = "127.0.0.1:9000",
-    proxy_listen_ssl = "127.0.0.1:9443",
     admin_listen = "0.0.0.0:9001",
     cluster_listen = "0.0.0.0:9946",
     cluster_listen_rpc = "0.0.0.0:9373",
-    cluster_profile = "local"
+    cluster_profile = "local",
+    custom_plugins = "first-request",
   },
   servroot2 = {
     prefix = "servroot2",
+    ssl = false,
+    admin_ssl = false,
     proxy_listen = "127.0.0.1:10000",
-    proxy_listen_ssl = "127.0.0.1:10443",
     admin_listen = "0.0.0.0:10001",
     cluster_listen = "0.0.0.0:10946",
     cluster_listen_rpc = "0.0.0.0:10373",
-    cluster_profile = "local"
+    cluster_profile = "local",
+    custom_plugins = "first-request",
   },
   servroot3 = {
     prefix = "servroot3",
+    ssl = false,
+    admin_ssl = false,
     proxy_listen = "127.0.0.1:20000",
-    proxy_listen_ssl = "127.0.0.1:20443",
     admin_listen = "0.0.0.0:20001",
     cluster_listen = "0.0.0.0:20946",
     cluster_listen_rpc = "0.0.0.0:20373",
-    cluster_profile = "local"
+    cluster_profile = "local",
+    custom_plugins = "first-request",
   }
 }
 
@@ -55,7 +60,7 @@ describe("Cluster", function()
 
   describe("Nodes", function()
     it("should register the node on startup", function()
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot1))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot1))
 
       -- Wait for node to be registered
       helpers.wait_until(function()
@@ -84,7 +89,7 @@ describe("Cluster", function()
       local conf = pl_tablex.deepcopy(NODES.servroot1)
       conf.cluster_advertise = "5.5.5.5:1234"
 
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, conf))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, conf))
 
       -- Wait for node to be registered
       helpers.wait_until(function()
@@ -111,13 +116,13 @@ describe("Cluster", function()
 
   describe("Auto-join", function()
     it("should register the second node on startup and auto-join sequentially", function()
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot1))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot1))
       -- Wait for first node to be registered
       helpers.wait_until(function()
         return helpers.dao.nodes:count() == 1
       end)
 
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot2))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot2))
       -- Wait for second node to be registered
       helpers.wait_until(function()
         return helpers.dao.nodes:count() == 2
@@ -146,10 +151,10 @@ describe("Cluster", function()
       end
     end)
 
-    it("should register the second node on startup and auto-join asyncronously", function()
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot1))
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot2))
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot3))
+    it("should register the second node on startup and auto-join asynchronously", function()
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot1))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot2))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot3))
 
       -- We need to wait a few seconds for the async job to kick in and join all the nodes together
       helpers.wait_until(function()
@@ -179,7 +184,7 @@ describe("Cluster", function()
 
   describe("Cache purges", function()
     it("must purge cache on all nodes on member-join", function()
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot1))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot1))
       -- Wait for first node to be registered
       helpers.wait_until(function()
         return helpers.dao.nodes:count() == 1
@@ -194,8 +199,21 @@ describe("Cluster", function()
           ["Content-Type"] = "application/json"
         },
         body = {
-          request_host = "test.com",
+          name = "test",
+          hosts = { "test.com" },
           upstream_url = "http://mockbin.org"
+        }
+      })
+      assert.res_status(201, res)
+      -- adding the first-request plugin
+      local res = assert(api_client:send {
+        method = "POST",
+        path = "/apis/test/plugins/",
+        headers = {
+          ["Content-Type"] = "application/json"
+        },
+        body = {
+          name = "first-request"
         }
       })
       assert.res_status(201, res)
@@ -216,14 +234,13 @@ describe("Cluster", function()
       -- Checking the element in the cache
       local res = assert(api_client:send {
         method = "GET",
-        path = "/cache/"..cache.all_apis_by_dict_key()
+        path = "/cache/requested"
       })
       local body = cjson.decode(assert.res_status(200, res))
-      assert.equal(1, pl_tablex.size(body.by_dns))
-      assert.is_table(body.by_dns["test.com"])
+      assert.True(body.requested)
 
       -- Starting second node
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot2))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot2))
       -- Wait for the second node to be registered
       helpers.wait_until(function()
         return helpers.dao.nodes:count() == 2
@@ -236,7 +253,7 @@ describe("Cluster", function()
         helpers.wait_until(function()
           local res = assert(api_client:send {
             method = "GET",
-            path = "/cache/"..cache.all_apis_by_dict_key()
+            path = "/cache/requested"
           })
           res:read_body()
           return res.status == 404
@@ -245,9 +262,9 @@ describe("Cluster", function()
     end)
 
     it("must purge cache on all nodes when a failed serf starts again (member-join event - simulation of a crash in a 3-node setup)", function()
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot1))
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot2))
-      assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, NODES.servroot3))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot1))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot2))
+      assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, NODES.servroot3))
 
       helpers.wait_until(function()
         local api_client = helpers.http_client("127.0.0.1", NODES_CONF.servroot1.admin_port, CLIENT_TIMEOUT)
@@ -270,8 +287,21 @@ describe("Cluster", function()
           ["Content-Type"] = "application/json"
         },
         body = {
-          request_host = "test.com",
+          name = "test",
+          hosts = { "test.com" },
           upstream_url = "http://mockbin.org"
+        }
+      })
+      assert.res_status(201, res)
+      -- adding the first-request plugin
+      local res = assert(api_client:send {
+        method = "POST",
+        path = "/apis/test/plugins/",
+        headers = {
+          ["Content-Type"] = "application/json"
+        },
+        body = {
+          name = "first-request"
         }
       })
       assert.res_status(201, res)
@@ -298,11 +328,11 @@ describe("Cluster", function()
         local api_client = helpers.http_client("127.0.0.1", v.admin_port, CLIENT_TIMEOUT)
         local res = assert(api_client:send {
           method = "GET",
-          path = "/cache/"..cache.all_apis_by_dict_key()
+          path = "/cache/requested"
         })
         local body = cjson.decode(assert.res_status(200, res))
         api_client:close()
-        assert.equal(1, pl_tablex.size(body.by_dns))
+        assert.True(body.requested)
       end
 
       -- The cluster status is "active" for all three nodes
@@ -349,9 +379,9 @@ describe("Cluster", function()
 
       -- The member has now failed, let's bring it up again
       assert(helpers.execute(string.format("%s agent -profile=wan -node=%s -rpc-addr=%s"
-                             .." -bind=%s -event-handler=member-join,"
-                             .."member-leave,member-failed,member-update,"
-                             .."member-reap,user:kong=%s > /dev/null &",
+                             .. " -bind=%s -event-handler=member-join,"
+                             .. "member-leave,member-failed,member-update,"
+                             .. "member-reap,user:kong=%s > /dev/null &",
                             helpers.test_conf.serf_path,
                             node_name,
                             NODES.servroot2.cluster_listen_rpc,
@@ -382,7 +412,7 @@ describe("Cluster", function()
           local api_client = helpers.http_client("127.0.0.1", v.admin_port, CLIENT_TIMEOUT)
           local res = assert(api_client:send {
             method = "GET",
-            path = "/cache/"..cache.all_apis_by_dict_key()
+            path = "/cache/requested"
           })
           api_client:close()
           return res.status == 404

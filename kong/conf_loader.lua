@@ -7,16 +7,16 @@ local pl_config = require "pl.config"
 local pl_file = require "pl.file"
 local pl_path = require "pl.path"
 local tablex = require "pl.tablex"
+local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
+local ciphers = require "kong.tools.ciphers"
 
 local DEFAULT_PATHS = {
-  "/etc/kong.conf",
-  "/etc/kong/kong.conf"
+  "/etc/kong/kong.conf",
+  "/etc/kong.conf"
 }
 
 local PREFIX_PATHS = {
-  dnsmasq_pid = {"pids", "dnsmasq.pid"}
-  ;
   serf_pid = {"pids", "serf.pid"},
   serf_log = {"logs", "serf.log"},
   serf_event = {"serf", "serf_event.sh"},
@@ -25,14 +25,23 @@ local PREFIX_PATHS = {
   nginx_pid = {"pids", "nginx.pid"},
   nginx_err_logs = {"logs", "error.log"},
   nginx_acc_logs = {"logs", "access.log"},
+  nginx_admin_acc_logs = {"logs", "admin_access.log"},
   nginx_conf = {"nginx.conf"},
   nginx_kong_conf = {"nginx-kong.conf"}
   ;
-  kong_conf = {"kong.conf"}
+  kong_env = {".kong_env"}
   ;
   ssl_cert_default = {"ssl", "kong-default.crt"},
   ssl_cert_key_default = {"ssl", "kong-default.key"},
   ssl_cert_csr_default = {"ssl", "kong-default.csr"}
+  ;
+  client_ssl_cert_default = {"ssl", "kong-default.crt"},
+  client_ssl_cert_key_default = {"ssl", "kong-default.key"},
+  client_ssl_cert_csr_default = {"ssl", "kong-default.csr"}
+  ;
+  admin_ssl_cert_default = {"ssl", "admin-kong-default.crt"},
+  admin_ssl_cert_key_default = {"ssl", "admin-kong-default.key"},
+  admin_ssl_cert_csr_default = {"ssl", "admin-kong-default.csr"}
 }
 
 -- By default, all properties in the configuration are considered to
@@ -51,35 +60,54 @@ local CONF_INFERENCES = {
   proxy_listen = {typ = "string"},
   proxy_listen_ssl = {typ = "string"},
   admin_listen = {typ = "string"},
+  admin_listen_ssl = {typ = "string"},
   cluster_listen = {typ = "string"},
   cluster_listen_rpc = {typ = "string"},
   cluster_advertise = {typ = "string"},
   nginx_worker_processes = {typ = "string"},
+  upstream_keepalive = {typ = "number"},
+  server_tokens = {typ = "boolean"},
+  latency_tokens = {typ = "boolean"},
+  error_default_type = {enum = {"application/json", "application/xml",
+                                "text/html", "text/plain"}},
+  client_max_body_size = {typ = "string"},
+  client_body_buffer_size = {typ = "string"},
+
 
   database = {enum = {"postgres", "cassandra"}},
   pg_port = {typ = "number"},
+  pg_password = {typ = "string"},
   pg_ssl = {typ = "boolean"},
   pg_ssl_verify = {typ = "boolean"},
 
   cassandra_contact_points = {typ = "array"},
   cassandra_port = {typ = "number"},
-  cassandra_repl_strategy = {enum = {"SimpleStrategy", "NetworkTopologyStrategy"}},
-  cassandra_repl_factor = {typ = "number"},
-  cassandra_data_centers = {typ = "array"},
-  cassandra_consistency = {enum = {"ALL", "EACH_QUORUM", "QUORUM", "LOCAL_QUORUM", "ONE",
-                                   "TWO", "THREE", "LOCAL_ONE"}}, -- no ANY: this is R/W
+  cassandra_password = {typ = "string"},
   cassandra_timeout = {typ = "number"},
   cassandra_ssl = {typ = "boolean"},
   cassandra_ssl_verify = {typ = "boolean"},
+  cassandra_consistency = {enum = {"ALL", "EACH_QUORUM", "QUORUM", "LOCAL_QUORUM", "ONE",
+                                   "TWO", "THREE", "LOCAL_ONE"}}, -- no ANY: this is R/W
+  cassandra_lb_policy = {enum = {"RoundRobin", "DCAwareRoundRobin"}},
+  cassandra_local_datacenter = {typ = "string"},
+  cassandra_repl_strategy = {enum = {"SimpleStrategy", "NetworkTopologyStrategy"}},
+  cassandra_repl_factor = {typ = "number"},
+  cassandra_data_centers = {typ = "array"},
+  cassandra_schema_consensus_timeout = {typ = "number"},
 
   cluster_profile = {enum = {"local", "lan", "wan"}},
   cluster_ttl_on_failure = {typ = "number"},
 
-  dnsmasq = {typ = "boolean"},
-  dnsmasq_port = {typ = "number"},
+  dns_resolver = {typ = "array"},
 
   ssl = {typ = "boolean"},
+  client_ssl = {typ = "boolean"},
+  admin_ssl = {typ = "boolean"},
 
+  proxy_access_log = {typ = "string"},
+  proxy_error_log = {typ = "string"},
+  admin_access_log = {typ = "string"},
+  admin_error_log = {typ = "string"},
   log_level = {enum = {"debug", "info", "notice", "warn",
                        "error", "crit", "alert", "emerg"}},
   custom_plugins = {typ = "array"},
@@ -88,7 +116,8 @@ local CONF_INFERENCES = {
   nginx_optimizations = {typ = "boolean"},
 
   lua_code_cache = {typ = "ngx_boolean"},
-  lua_ssl_verify_depth = {typ = "number"}
+  lua_ssl_verify_depth = {typ = "number"},
+  lua_socket_pool_size = {typ = "number"},
 }
 
 -- List of settings whose values must not be printed when
@@ -140,6 +169,10 @@ local function check_and_infer(conf)
       -- separated strings to tables (but not when the arr has
       -- only one element)
       value = setmetatable(pl_stringx.split(value, ","), nil) -- remove List mt
+
+      for i = 1, #value do
+        value[i] = pl_stringx.strip(value[i])
+      end
     end
 
     if value == "" then
@@ -149,10 +182,10 @@ local function check_and_infer(conf)
 
     typ = typ or "string"
     if value and not typ_checks[typ](value) then
-      errors[#errors+1] = k.." is not a "..typ..": '"..tostring(value).."'"
+      errors[#errors+1] = k .. " is not a " .. typ .. ": '" .. tostring(value) .. "'"
     elseif v_schema.enum and not tablex.find(v_schema.enum, value) then
-      errors[#errors+1] = k.." has an invalid value: '"..tostring(value)
-                          .."' ("..table.concat(v_schema.enum, ", ")..")"
+      errors[#errors+1] = k .. " has an invalid value: '" .. tostring(value)
+                          .. "' (" .. table.concat(v_schema.enum, ", ") .. ")"
     end
 
     conf[k] = value
@@ -162,6 +195,24 @@ local function check_and_infer(conf)
   -- custom validations
   ---------------------
 
+  if conf.cassandra_lb_policy == "DCAwareRoundRobin" and
+     not conf.cassandra_local_datacenter then
+     errors[#errors+1] = "must specify 'cassandra_local_datacenter' when " ..
+                        "DCAwareRoundRobin policy is in use"
+  end
+
+  for _, contact_point in ipairs(conf.cassandra_contact_points) do
+    local endpoint, err = utils.normalize_ip(contact_point)
+    if not endpoint then
+      errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
+                          "': " .. err
+
+    elseif endpoint.port then
+      errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
+                          "': port must be specified in cassandra_port"
+    end
+  end
+
   if conf.ssl then
     if conf.ssl_cert and not conf.ssl_cert_key then
       errors[#errors+1] = "ssl_cert_key must be specified"
@@ -170,27 +221,72 @@ local function check_and_infer(conf)
     end
 
     if conf.ssl_cert and not pl_path.exists(conf.ssl_cert) then
-      errors[#errors+1] = "ssl_cert: no such file at "..conf.ssl_cert
+      errors[#errors+1] = "ssl_cert: no such file at " .. conf.ssl_cert
     end
     if conf.ssl_cert_key and not pl_path.exists(conf.ssl_cert_key) then
-      errors[#errors+1] = "ssl_cert_key: no such file at "..conf.ssl_cert_key
+      errors[#errors+1] = "ssl_cert_key: no such file at " .. conf.ssl_cert_key
     end
   end
 
-  if conf.dns_resolver and conf.dnsmasq then
-    errors[#errors+1] = "must disable dnsmasq when a custom DNS resolver is specified"
-  elseif not conf.dns_resolver and not conf.dnsmasq then
-    errors[#errors+1] = "must specify a custom DNS resolver when dnsmasq is turned off"
+  if conf.client_ssl then
+    if conf.client_ssl_cert and not conf.client_ssl_cert_key then
+      errors[#errors+1] = "client_ssl_cert_key must be specified"
+    elseif conf.client_ssl_cert_key and not conf.client_ssl_cert then
+      errors[#errors+1] = "client_ssl_cert must be specified"
+    end
+
+    if conf.client_ssl_cert and not pl_path.exists(conf.client_ssl_cert) then
+      errors[#errors+1] = "client_ssl_cert: no such file at " .. conf.client_ssl_cert
+    end
+    if conf.client_ssl_cert_key and not pl_path.exists(conf.client_ssl_cert_key) then
+      errors[#errors+1] = "client_ssl_cert_key: no such file at " .. conf.client_ssl_cert_key
+    end
   end
 
-  local ipv4_port_pattern = "^(%d+)%.(%d+)%.(%d+)%.(%d+):(%d+)$"
-  if not conf.cluster_listen:match(ipv4_port_pattern) then
+  if conf.admin_ssl then
+    if conf.admin_ssl_cert and not conf.admin_ssl_cert_key then
+      errors[#errors+1] = "admin_ssl_cert_key must be specified"
+    elseif conf.admin_ssl_cert_key and not conf.admin_ssl_cert then
+      errors[#errors+1] = "admin_ssl_cert must be specified"
+    end
+
+    if conf.admin_ssl_cert and not pl_path.exists(conf.admin_ssl_cert) then
+      errors[#errors+1] = "admin_ssl_cert: no such file at " .. conf.admin_ssl_cert
+    end
+    if conf.admin_ssl_cert_key and not pl_path.exists(conf.admin_ssl_cert_key) then
+      errors[#errors+1] = "admin_ssl_cert_key: no such file at " .. conf.admin_ssl_cert_key
+    end
+  end
+
+  if conf.ssl_cipher_suite ~= "custom" then
+    local ok, err = pcall(function()
+      conf.ssl_ciphers = ciphers(conf.ssl_cipher_suite)
+    end)
+    if not ok then
+      errors[#errors + 1] = err
+    end
+  end
+
+  if conf.dns_resolver then
+    for _, server in ipairs(conf.dns_resolver) do
+      local dns = utils.normalize_ip(server)
+      if not dns or dns.type ~= "ipv4" then
+        errors[#errors+1] = "dns_resolver must be a comma separated list in " ..
+                            "the form of IPv4 or IPv4:port, got '" .. server .. "'"
+      end
+    end
+  end
+
+  local ip, port = utils.normalize_ipv4(conf.cluster_listen)
+  if not (ip and port) then
     errors[#errors+1] = "cluster_listen must be in the form of IPv4:port"
   end
-  if not conf.cluster_listen_rpc:match(ipv4_port_pattern) then
+  ip, port = utils.normalize_ipv4(conf.cluster_listen_rpc)
+  if not (ip and port) then
     errors[#errors+1] = "cluster_listen_rpc must be in the form of IPv4:port"
   end
-  if conf.cluster_advertise and not conf.cluster_advertise:match(ipv4_port_pattern) then
+  ip, port = utils.normalize_ipv4(conf.cluster_advertise or "")
+  if conf.cluster_advertise and not (ip and port) then
     errors[#errors+1] = "cluster_advertise must be in the form of IPv4:port"
   end
   if conf.cluster_ttl_on_failure < 60 then
@@ -216,7 +312,7 @@ local function overrides(k, default_v, file_conf, arg_conf)
   end
 
   -- environment variables have higher priority
-  local env_name = "KONG_"..string.upper(k)
+  local env_name = "KONG_" .. string.upper(k)
   local env = os.getenv(env_name)
   if env ~= nil then
     local to_print = env
@@ -253,7 +349,9 @@ local function load(path, custom_conf)
   local s = pl_stringio.open(kong_default_conf)
   local defaults, err = pl_config.read(s)
   s:close()
-  if not defaults then return nil, "could not load default conf: "..err end
+  if not defaults then
+    return nil, "could not load default conf: " .. err
+  end
 
   ---------------------
   -- Configuration file
@@ -262,7 +360,7 @@ local function load(path, custom_conf)
   local from_file_conf = {}
   if path and not pl_path.exists(path) then
     -- file conf has been specified and must exist
-    return nil, "no file at: "..path
+    return nil, "no file at: " .. path
   elseif not path then
     -- try to look for a conf in default locations, but no big
     -- deal if none is found: we will use our defaults.
@@ -279,7 +377,9 @@ local function load(path, custom_conf)
     log.verbose("no config file, skipping loading")
   else
     local f, err = pl_file.read(path)
-    if not f then return nil, err end
+    if not f then
+      return nil, err
+    end
 
     log.verbose("reading config file at %s", path)
     local s = pl_stringio.open(f)
@@ -288,7 +388,9 @@ local function load(path, custom_conf)
       list_delim = "_blank_" -- mandatory but we want to ignore it
     })
     s:close()
-    if not from_file_conf then return nil, err end
+    if not from_file_conf then
+      return nil, err
+    end
   end
 
   -----------------------
@@ -300,7 +402,9 @@ local function load(path, custom_conf)
 
   -- validation
   local ok, err, errors = check_and_infer(conf)
-  if not ok then return nil, err, errors end
+  if not ok then
+    return nil, err, errors
+  end
 
   conf = tablex.merge(conf, defaults) -- intersection (remove extraneous properties)
 
@@ -313,7 +417,7 @@ local function load(path, custom_conf)
         to_print = "******"
       end
 
-      conf_arr[#conf_arr+1] = k.." = "..pl_pretty.write(to_print, "")
+      conf_arr[#conf_arr+1] = k .. " = " .. pl_pretty.write(to_print, "")
     end
 
     table.sort(conf_arr)
@@ -331,7 +435,7 @@ local function load(path, custom_conf)
   do
     local custom_plugins = {}
     for i = 1, #conf.custom_plugins do
-      local plugin_name = conf.custom_plugins[i]
+      local plugin_name = pl_stringx.strip(conf.custom_plugins[i])
       custom_plugins[plugin_name] = true
     end
     conf.plugins = tablex.merge(constants.PLUGINS_AVAILABLE, custom_plugins, true)
@@ -342,6 +446,7 @@ local function load(path, custom_conf)
   do
     local ip_port_pat = "(.+):([%d]+)$"
     local admin_ip, admin_port = string.match(conf.admin_listen, ip_port_pat)
+    local admin_ssl_ip, admin_ssl_port = string.match(conf.admin_listen_ssl, ip_port_pat)
     local proxy_ip, proxy_port = string.match(conf.proxy_listen, ip_port_pat)
     local proxy_ssl_ip, proxy_ssl_port = string.match(conf.proxy_listen_ssl, ip_port_pat)
 
@@ -349,9 +454,11 @@ local function load(path, custom_conf)
     elseif not proxy_port then return nil, "proxy_listen must be of form 'address:port'"
     elseif not proxy_ssl_port then return nil, "proxy_listen_ssl must be of form 'address:port'" end
     conf.admin_ip = admin_ip
+    conf.admin_ssl_ip = admin_ssl_ip
     conf.proxy_ip = proxy_ip
     conf.proxy_ssl_ip = proxy_ssl_ip
     conf.admin_port = tonumber(admin_port)
+    conf.admin_ssl_port = tonumber(admin_ssl_port)
     conf.proxy_port = tonumber(proxy_port)
     conf.proxy_ssl_port = tonumber(proxy_ssl_port)
   end
@@ -364,12 +471,26 @@ local function load(path, custom_conf)
     conf.ssl_cert_key = pl_path.abspath(conf.ssl_cert_key)
   end
 
+  if conf.client_ssl_cert and conf.client_ssl_cert_key then
+    conf.client_ssl_cert = pl_path.abspath(conf.client_ssl_cert)
+    conf.client_ssl_cert_key = pl_path.abspath(conf.client_ssl_cert_key)
+  end
+
+  if conf.admin_ssl_cert and conf.admin_ssl_cert_key then
+    conf.admin_ssl_cert = pl_path.abspath(conf.admin_ssl_cert)
+    conf.admin_ssl_cert_key = pl_path.abspath(conf.admin_ssl_cert_key)
+  end
+
   -- attach prefix files paths
   for property, t_path in pairs(PREFIX_PATHS) do
     conf[property] = pl_path.join(conf.prefix, unpack(t_path))
   end
 
   log.verbose("prefix in use: %s", conf.prefix)
+
+  -- initialize the dns client, so the globally patched tcp.connect method
+  -- will work from here onwards.
+  assert(require("kong.tools.dns")(conf))
 
   return setmetatable(conf, nil) -- remove Map mt
 end

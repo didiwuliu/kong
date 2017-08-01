@@ -7,6 +7,7 @@
 
 local BIN_PATH = "bin/kong"
 local TEST_CONF_PATH = "spec/kong_tests.conf"
+local CUSTOM_PLUGIN_PATH = "./spec/fixtures/custom_plugins/?.lua"
 
 local conf_loader = require "kong.conf_loader"
 local DAOFactory = require "kong.dao.factory"
@@ -21,18 +22,37 @@ local log = require "kong.cmd.utils.log"
 
 log.set_lvl(log.levels.quiet) -- disable stdout logs in tests
 
+-- Add to package path so dao helpers can insert custom plugins
+-- (while running from the busted environment)
+package.path = CUSTOM_PLUGIN_PATH .. ";" .. package.path
+
 ---------------
 -- Conf and DAO
 ---------------
 local conf = assert(conf_loader(TEST_CONF_PATH))
-local dao = DAOFactory(conf)
+local dao = assert(DAOFactory.new(conf))
 -- make sure migrations are up-to-date
---assert(dao:run_migrations())
+assert(dao:run_migrations())
 
 -----------------
 -- Custom helpers
 -----------------
 local resty_http_proxy_mt = {}
+
+local pack = function(...) return { n = select("#", ...), ... } end
+local unpack = function(t) return unpack(t, 1, t.n) end
+
+--- Prints all returned parameters.
+-- Simple debugging aid.
+-- @usage -- modify
+-- local a,b = some_func(c,d)
+-- -- into
+-- local a,b = intercept(some_func(c,d))
+local function intercept(...)
+  local args = pack(...)
+  print(require("pl.pretty").write(args))
+  return unpack(args)
+end
 
 -- Case insensitive lookup function, returns the value and the original key. Or
 -- if not found nil and the search key
@@ -73,15 +93,24 @@ local function wait_until(f, timeout)
 
   timeout = timeout or 2
   local tstart = ngx.time()
-  local texp, ok = tstart + timeout
+  local texp = tstart + timeout
+  local ok, res, err
 
   repeat
     ngx.sleep(0.2)
-    ok = f()
-  until ok or ngx.time() >= texp
+    ok, res, err = pcall(f)
+  until not ok or res or ngx.time() >= texp
 
   if not ok then
-    error("wait_until() timeout", 2)
+    -- report error from `f`, such as assert gone wrong
+    error(tostring(res), 2)
+  elseif not res and err then
+    -- report a failure for `f` to meet its condition
+    -- and eventually an error return value which could be the cause
+    error("wait_until() timeout: " .. tostring(err) .. " (after delay: " .. timeout .. "s)", 2)
+  elseif not res then
+    -- report a failure for `f` to meet its condition
+    error("wait_until() timeout (after delay " .. timeout .. "s)", 2)
   end
 end
 
@@ -119,11 +148,11 @@ function resty_http_proxy_mt:send(opts)
     local body = ""
 
     for k, v in pairs(form) do
-      body = body.."--"..boundary.."\r\nContent-Disposition: form-data; name=\""..k.."\"\r\n\r\n"..tostring(v).."\r\n"
+      body = body .. "--" .. boundary .. "\r\nContent-Disposition: form-data; name=\"" .. k .. "\"\r\n\r\n" .. tostring(v) .. "\r\n"
     end
 
     if body ~= "" then
-      body = body.."--"..boundary.."--\r\n"
+      body = body .. "--" .. boundary .. "--\r\n"
     end
 
     local clength = lookup(headers, "content-length")
@@ -132,7 +161,7 @@ function resty_http_proxy_mt:send(opts)
     end
 
     if not content_type:find("boundary=") then
-      headers[content_type_name] = content_type.."; boundary="..boundary
+      headers[content_type_name] = content_type .. "; boundary=" .. boundary
     end
 
     opts.body = body
@@ -141,7 +170,7 @@ function resty_http_proxy_mt:send(opts)
   -- build querystring (assumes none is currently in 'opts.path')
   if type(opts.query) == "table" then
     local qs = utils.encode_args(opts.query)
-    opts.path = opts.path.."?"..qs
+    opts.path = opts.path .. "?" .. qs
     opts.query = nil
   end
 
@@ -151,7 +180,7 @@ function resty_http_proxy_mt:send(opts)
     -- times
     local reader = res.read_body
     res.read_body = function(self)
-      if (not self._cached_body) and (not self._cached_error) then
+      if not self._cached_body and not self._cached_error then
         self._cached_body, self._cached_error = reader(self)
       end
       return self._cached_body, self._cached_error
@@ -198,7 +227,7 @@ end
 -- @name proxy_ssl_client
 local function proxy_ssl_client(timeout)
   local client = http_client(conf.proxy_ip, conf.proxy_ssl_port, timeout)
-  client:ssl_handshake()
+  assert(client:ssl_handshake())
   return client
 end
 
@@ -229,9 +258,9 @@ local function tcp_server(port, ...)
       assert(server:setoption('reuseaddr', true))
       assert(server:bind("*", port))
       assert(server:listen())
-      local client = server:accept()
-      local line, err = client:receive()
-      if not err then client:send(line .. "\n") end
+      local client = assert(server:accept())
+      local line = assert(client:receive())
+      client:send(line .. "\n")
       client:close()
       server:close()
       return line
@@ -258,7 +287,7 @@ local function http_server(port, ...)
       assert(server:setoption('reuseaddr', true))
       assert(server:bind("*", port))
       assert(server:listen())
-      local client = server:accept()
+      local client = assert(server:accept())
 
       local lines = {}
       local line, err
@@ -302,12 +331,12 @@ local function udp_server(port)
     function(port)
       local socket = require "socket"
       local server = assert(socket.udp())
-      server:settimeout(10)
+      server:settimeout(5)
       server:setoption("reuseaddr", true)
       server:setsockname("127.0.0.1", port)
-      local data = server:receive()
+      local data, err = server:receive()
       server:close()
-      return data
+      return data, err
     end
   }, port or 9999)
 
@@ -326,26 +355,13 @@ end
 local say = require "say"
 local luassert = require "luassert.assert"
 
--- wrap assert and create a new kong-assert state table for each call
-local old_assert = assert
-local kong_state
-assert = function(...)
-  kong_state = {}
-  return old_assert(...)
-end
-
--- tricky part: the assertions below, should not reset the `kong_state`
--- inserted above. Hence we shadow the global assert (patched one) with a local
--- assert (unpatched) to prevent this.
-local assert = old_assert
-
 --- Generic modifier "response".
 -- Will set a "response" value in the assertion state, so following
 -- assertions will operate on the value set.
 -- @name response
 -- @param response results from `http_client:send` function.
 -- @usage
--- local res = assert(client:send { ..your request parameters here ..})
+-- local res = assert(client:send { .. your request parameters here ..})
 -- local length = assert.response(res).has.header("Content-Length")
 local function modifier_response(state, arguments, level)
   assert(arguments.n > 0,
@@ -354,10 +370,10 @@ local function modifier_response(state, arguments, level)
   local res = arguments[1]
 
   assert(type(res) == "table" and type(res.read_body) == "function",
-         "response modifier requires a response object as argument, got: "..tostring(res))
+         "response modifier requires a response object as argument, got: " .. tostring(res))
 
-  kong_state.kong_response = res
-  kong_state.kong_request = nil
+  rawset(state, "kong_response", res)
+  rawset(state, "kong_request", nil)
 
   return state
 end
@@ -371,24 +387,24 @@ luassert:register("modifier", "response", modifier_response)
 -- @param response results from `http_client:send` function. The request will
 -- be extracted from the response.
 -- @usage
--- local res = assert(client:send { ..your request parameters here ..})
+-- local res = assert(client:send { .. your request parameters here ..})
 -- local length = assert.request(res).has.header("Content-Length")
 local function modifier_request(state, arguments, level)
   local generic = "The assertion 'request' modifier takes a http response"
-                .." object as input to decode the json-body returned by"
-                .." httpbin.org/mockbin.org, to retrieve the proxied request."
+                .. " object as input to decode the json-body returned by"
+                .. " httpbin.org/mockbin.org, to retrieve the proxied request."
 
   local res = arguments[1]
 
   assert(type(res) == "table" and type(res.read_body) == "function",
-         "Expected a http response object, got '"..tostring(res).."'. "..generic)
+         "Expected a http response object, got '" .. tostring(res) .. "'. " .. generic)
 
   local body, err
   body = assert(res:read_body())
   body, err = cjson.decode(body)
 
   assert(body, "Expected the http response object to have a json encoded body,"
-             .." but decoding gave error '"..tostring(err).."'. "..generic)
+             .. " but decoding gave error '" .. tostring(err) .. "'. " .. generic)
 
   -- check if it is a mockbin request
   if lookup((res.headers or {}),"X-Powered-By") ~= "mockbin" then
@@ -397,8 +413,8 @@ local function modifier_request(state, arguments, level)
            "Could not determine the response to be from either mockbin.com or httpbin.org")
   end
 
-  kong_state.kong_request = body
-  kong_state.kong_response = nil
+  rawset(state, "kong_request", body)
+  rawset(state, "kong_response", nil)
 
   return state
 end
@@ -442,7 +458,7 @@ local function contains(state, args)
   local expected, arr, pattern = unpack(args)
   local found
   for i = 1, #arr do
-    if (pattern and string.match(arr[i], expected)) or (arr[i] == expected) then
+    if (pattern and string.match(arr[i], expected)) or arr[i] == expected then
       found = i
       break
     end
@@ -474,21 +490,21 @@ luassert:register("assertion", "contains", contains,
 -- local body = assert.has.status(200, res)             -- or alternativly
 -- local body = assert.response(res).has.status(200)    -- does the same
 local function res_status(state, args)
-  assert(not kong_state.kong_request,
+  assert(not rawget(state, "kong_request"),
          "Cannot check statuscode against a request object,"
-       .." only against a response object")
+       .. " only against a response object")
 
   local expected = args[1]
-  local res = args[2] or kong_state.kong_response
+  local res = args[2] or rawget(state, "kong_response")
 
   assert(type(expected) == "number",
-         "Expected response code must be a number value. Got: "..tostring(expected))
+         "Expected response code must be a number value. Got: " .. tostring(expected))
   assert(type(res) == "table" and type(res.read_body) == "function",
-         "Expected a http_client response. Got: "..tostring(res))
+         "Expected a http_client response. Got: " .. tostring(res))
 
   if expected ~= res.status then
     local body, err = res:read_body()
-    if not body then body = "Error reading body: "..err end
+    if not body then body = "Error reading body: " .. err end
     table.insert(args, 1, pl_stringx.strip(body))
     table.insert(args, 1, res.status)
     table.insert(args, 1, expected)
@@ -504,7 +520,7 @@ local function res_status(state, args)
 
       local str_t = pl_stringx.splitlines(str)
       local first_line = #str_t - math.min(60, #str_t) + 1
-      local msg_t = {"\nError logs ("..conf.nginx_err_logs.."):"}
+      local msg_t = {"\nError logs (" .. conf.nginx_err_logs .. "):"}
       for i = first_line, #str_t do
         msg_t[#msg_t+1] = str_t[i]
       end
@@ -517,7 +533,7 @@ local function res_status(state, args)
   else
     local body, err = res:read_body()
     local output = body
-    if not output then output = "Error reading body: "..err end
+    if not output then output = "Error reading body: " .. err end
     output = pl_stringx.strip(output)
     table.insert(args, 1, output)
     table.insert(args, 1, res.status)
@@ -559,24 +575,24 @@ luassert:register("assertion", "res_status", res_status,
 -- local res = assert(client:send { .. your request params here .. })
 -- local json_table = assert.response(res).has.jsonbody()
 local function jsonbody(state, args)
-  assert(args[1] == nil and kong_state.kong_request or kong_state.kong_response,
-         "the `jsonbody` assertion does not take parameters. "..
+  assert(args[1] == nil and rawget(state, "kong_request") or rawget(state, "kong_response"),
+         "the `jsonbody` assertion does not take parameters. " ..
          "Use the `response`/`require` modifiers to set the target to operate on")
 
-  if kong_state.kong_response then
-    local body = kong_state.kong_response:read_body()
+  if rawget(state, "kong_response") then
+    local body = rawget(state, "kong_response"):read_body()
     local json, err = cjson.decode(body)
     if not json then
-      table.insert(args, 1, "Error decoding: "..tostring(err).."\nResponse body:"..body)
+      table.insert(args, 1, "Error decoding: " .. tostring(err) .. "\nResponse body:" .. body)
       args.n = 1
       return false
     end
     return true, {json}
   else
-    assert(kong_state.kong_request.postData, "No post data found in the request. Only mockbin.com is supported!")
-    local json, err = cjson.decode(kong_state.kong_request.postData.text)
+    assert(rawget(state, "kong_request").postData, "No post data found in the request. Only mockbin.com is supported!")
+    local json, err = cjson.decode(rawget(state, "kong_request").postData.text)
     if not json then
-      table.insert(args, 1, "Error decoding: "..tostring(err).."\nRequest body:"..kong_state.kong_request.postData.text)
+      table.insert(args, 1, "Error decoding: " .. tostring(err) .. "\nRequest body:" .. rawget(state, "kong_request").postData.text)
       args.n = 1
       return false
     end
@@ -604,7 +620,7 @@ luassert:register("assertion", "jsonbody", jsonbody,
 -- @return value of the header
 local function res_header(state, args)
   local header = args[1]
-  local res = args[2] or kong_state.kong_request or kong_state.kong_response
+  local res = args[2] or rawget(state, "kong_request") or rawget(state, "kong_response")
   assert(type(res) == "table" and type(res.headers) == "table",
          "'header' assertion input does not contain a 'headers' subtable")
   local value = lookup(res.headers, header)
@@ -640,7 +656,7 @@ luassert:register("assertion", "header", res_header,
 -- @return value of the parameter
 local function req_query_param(state, args)
   local param = args[1]
-  local req = kong_state.kong_request
+  local req = rawget(state, "kong_request")
   assert(req, "'queryparam' assertion only works with a request object")
   local params
   if type(req.queryString) == "table" then
@@ -686,14 +702,14 @@ luassert:register("assertion", "queryparam", req_query_param,
 -- @return value of the parameter
 local function req_form_param(state, args)
   local param = args[1]
-  local req = kong_state.kong_request
+  local req = rawget(state, "kong_request")
   assert(req, "'formparam' assertion can only be used with a mockbin/httpbin request object")
 
   local value
   if req.postData then
     -- mockbin request
     value = lookup((req.postData or {}).params, param)
-  elseif (type(req.url) == "string") and (req.url:find("//httpbin.org", 1, true)) then
+  elseif type(req.url) == "string" and req.url:find("//httpbin.org", 1, true) then
     -- hhtpbin request
     value = lookup(req.form or {}, param)
   else
@@ -752,12 +768,23 @@ local function kong_exec(cmd, env)
   cmd = cmd or ""
   env = env or {}
 
+  -- Insert the Lua path to the custom-plugin fixtures
+  if not env.lua_package_path then
+    env.lua_package_path = CUSTOM_PLUGIN_PATH
+
+  else
+    env.lua_package_path = CUSTOM_PLUGIN_PATH .. ";" .. env.lua_package_path
+  end
+
+  env.lua_package_path = env.lua_package_path .. ";" .. conf.lua_package_path
+
+  -- build Kong environment variables
   local env_vars = ""
   for k, v in pairs(env) do
     env_vars = string.format("%s KONG_%s='%s'", env_vars, k:upper(), v)
   end
 
-  return exec(env_vars.." "..BIN_PATH.." "..cmd)
+  return exec(env_vars .. " " .. BIN_PATH .. " " .. cmd)
 end
 
 --- Prepare the Kong environment.
@@ -767,7 +794,7 @@ end
 -- @name prepare_prefix
 local function prepare_prefix(prefix)
   prefix = prefix or conf.prefix
-  exec("rm -rf "..prefix.."/*")
+  exec("rm -rf " .. prefix .. "/*")
   return pl_dir.makepath(prefix)
 end
 
@@ -781,6 +808,25 @@ local function clean_prefix(prefix)
   if pl_path.exists(prefix) then
     pl_dir.rmtree(prefix)
   end
+end
+
+--- Waits for invalidation of a cached key by polling the mgt-api
+-- and waiting for a 404 response.
+-- @name wait_for_invalidation
+-- @param key the cache-key to check
+-- @param timeout (optional) in seconds, defaults to 10.
+local function wait_for_invalidation(key, timeout)
+  local api_client = admin_client()
+  timeout = timeout or 10
+  wait_until(function()
+    local res = assert(api_client:send {
+      method = "GET",
+      path = "/cache/" .. key,
+      headers = {}
+    })
+    res:read_body()
+    return res.status == 404
+  end, timeout)
 end
 
 ----------
@@ -813,17 +859,26 @@ return {
   proxy_ssl_client = proxy_ssl_client,
   prepare_prefix = prepare_prefix,
   clean_prefix = clean_prefix,
+  wait_for_invalidation = wait_for_invalidation,
+  
+  -- miscellaneous
+  intercept = intercept,
 
   start_kong = function(env)
     env = env or {}
     local ok, err = prepare_prefix(env.prefix)
     if not ok then return nil, err end
 
-    return kong_exec("start --conf "..TEST_CONF_PATH, env)
+    local nginx_conf = ""
+    if env.nginx_conf then
+      nginx_conf = " --nginx-conf " .. env.nginx_conf
+    end
+
+    return kong_exec("start --conf " .. TEST_CONF_PATH .. nginx_conf, env)
   end,
   stop_kong = function(prefix, preserve_prefix)
     prefix = prefix or conf.prefix
-    local ok, err = kong_exec("stop --prefix "..prefix)
+    local ok, err = kong_exec("stop --prefix " .. prefix)
     dao:truncate_tables()
     if not preserve_prefix then
       clean_prefix(prefix)
@@ -837,12 +892,11 @@ return {
     dao:truncate_tables()
 
     local default_conf = conf_loader(nil, {prefix = prefix or conf.prefix})
-    local running_conf = conf_loader(default_conf.kong_conf)
+    local running_conf = conf_loader(default_conf.kong_env)
     if not running_conf then return end
 
     -- kill kong_tests.conf services
     for _, pid_path in ipairs {running_conf.nginx_pid,
-                               running_conf.dnsmasq_pid,
                                running_conf.serf_pid} do
       if pl_path.exists(pid_path) then
         kill.kill(pid_path, "-TERM")

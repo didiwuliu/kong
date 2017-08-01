@@ -3,11 +3,11 @@ local Errors = require "kong.dao.errors"
 
 local function load_config_schema(plugin_t)
   if plugin_t.name then
-    local loaded, plugin_schema = utils.load_module_if_exists("kong.plugins."..plugin_t.name..".schema")
+    local loaded, plugin_schema = utils.load_module_if_exists("kong.plugins." .. plugin_t.name .. ".schema")
     if loaded then
       return plugin_schema
     else
-      return nil, 'Plugin "'..tostring(plugin_t.name)..'" not found'
+      return nil, 'Plugin "' .. tostring(plugin_t.name) .. '" not found'
     end
   end
 end
@@ -101,7 +101,7 @@ return {
       elseif #rows > 0 then
         for _, row in ipairs(rows) do
           if row.name == plugin_t.name and row.api_id == plugin_t.api_id and row.consumer_id == plugin_t.consumer_id then
-            return false, Errors.unique "Plugin configuration already exists"
+            return false, Errors.unique { name = plugin_t.name }
           end
         end
       end

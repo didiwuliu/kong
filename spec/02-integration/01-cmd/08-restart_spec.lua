@@ -16,56 +16,45 @@ describe("kong restart", function()
     assert.not_equal("", stderr)
   end)
   it("restarts if not running", function()
-    assert(helpers.kong_exec("restart --conf "..helpers.test_conf_path))
+    assert(helpers.kong_exec("restart --conf " .. helpers.test_conf_path))
   end)
   it("restarts if already running from --conf", function()
-    local env = {
-      dnsmasq = true,
-      dns_resolver = ""
-    }
-
-    assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, {}))
+    ngx.sleep(2)
     local serf_pid = assert(helpers.file.read(helpers.test_conf.serf_pid))
     local nginx_pid = assert(helpers.file.read(helpers.test_conf.nginx_pid))
-    local dnsmasq_pid = assert(helpers.file.read(helpers.test_conf.dnsmasq_pid))
 
-    assert(helpers.kong_exec("restart --conf "..helpers.test_conf_path, env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("restart --conf " .. helpers.test_conf_path, {}))
+    ngx.sleep(2)
     assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.nginx_pid)), nginx_pid)
     assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.serf_pid)), serf_pid)
-    assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.dnsmasq_pid)), dnsmasq_pid)
   end)
   it("restarts if already running from --prefix", function()
     local env = {
-      dnsmasq = true,
-      dns_resolver = "",
       pg_database = helpers.test_conf.pg_database
     }
 
-    assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, env))
+    ngx.sleep(2)
     local serf_pid = assert(helpers.file.read(helpers.test_conf.serf_pid))
     local nginx_pid = assert(helpers.file.read(helpers.test_conf.nginx_pid))
-    local dnsmasq_pid = assert(helpers.file.read(helpers.test_conf.dnsmasq_pid))
 
-    assert(helpers.kong_exec("restart --prefix "..helpers.test_conf.prefix, env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("restart --prefix " .. helpers.test_conf.prefix, env))
+    ngx.sleep(2)
     assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.nginx_pid)), nginx_pid)
     assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.serf_pid)), serf_pid)
-    assert.is_not.equal(assert(helpers.file.read(helpers.test_conf.dnsmasq_pid)), dnsmasq_pid)
   end)
   it("accepts a custom nginx template", function()
     local env = {
       pg_database = helpers.test_conf.pg_database
     }
 
-    assert(helpers.kong_exec("start --conf "..helpers.test_conf_path, env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("start --conf " .. helpers.test_conf_path, env))
+    ngx.sleep(2)
 
-    assert(helpers.kong_exec("restart --prefix "..helpers.test_conf.prefix
-           .." --nginx-conf spec/fixtures/custom_nginx.template", env))
-    ngx.sleep(1)
+    assert(helpers.kong_exec("restart --prefix " .. helpers.test_conf.prefix
+           .. " --nginx-conf spec/fixtures/custom_nginx.template", env))
+    ngx.sleep(2)
 
     -- new server
     local client = helpers.http_client("0.0.0.0", 9999, 5000)
@@ -82,7 +71,6 @@ describe("kong restart", function()
       database = helpers.test_conf.database,
       pg_database = helpers.test_conf.pg_database,
       cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
-      dnsmasq = true,
       dns_resolver = ""
     }
 

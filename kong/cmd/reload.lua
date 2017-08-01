@@ -1,4 +1,3 @@
-local dnsmasq_signals = require "kong.cmd.utils.dnsmasq_signals"
 local prefix_handler = require "kong.cmd.utils.prefix_handler"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
 local serf_signals = require "kong.cmd.utils.serf_signals"
@@ -15,17 +14,16 @@ local function execute(args)
   }))
   log.enable()
   assert(pl_path.exists(default_conf.prefix),
-         "no such prefix: "..default_conf.prefix)
+         "no such prefix: " .. default_conf.prefix)
 
   -- load <PREFIX>/kong.conf containing running node's config
-  local conf = assert(conf_loader(default_conf.kong_conf, {
+  local conf = assert(conf_loader(default_conf.kong_env, {
     prefix = args.prefix
   }))
   assert(prefix_handler.prepare_prefix(conf, args.nginx_conf))
-  if conf.dnsmasq then
-    assert(dnsmasq_signals.start(conf))
-  end
-  assert(serf_signals.start(conf, DAOFactory(conf)))
+
+  local dao = assert(DAOFactory.new(conf))
+  assert(serf_signals.start(conf, dao))
   assert(nginx_signals.reload(conf))
   log("Kong reloaded")
 end
@@ -42,9 +40,9 @@ and stop the old ones when they have finished processing
 current requests.
 
 Options:
- -c,--conf    (optional string) configuration file
- -p,--prefix  (optional string) prefix Kong is running at
- --nginx-conf (optional string) custom Nginx configuration template
+ -c,--conf     (optional string) configuration file
+ -p,--prefix   (optional string) prefix Kong is running at
+ --nginx-conf  (optional string) custom Nginx configuration template
 ]]
 
 return {

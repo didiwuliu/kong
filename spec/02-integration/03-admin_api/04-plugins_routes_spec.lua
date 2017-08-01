@@ -30,8 +30,8 @@ describe("Admin API", function()
     setup(function()
       for i = 1, 3 do
         local api = assert(helpers.dao.apis:insert {
-          name = "api-"..i,
-          request_host = i.."-api.com",
+          name = "api-" .. i,
+          hosts = { i .. "-api.com" },
           upstream_url = "http://mockbin.com"
         })
 
@@ -64,7 +64,8 @@ describe("Admin API", function()
           headers = {["Content-Type"] = "application/json"}
         })
         local body = assert.response(res).has.status(405)
-        assert.equal([[{"message":"Method not allowed"}]], body)
+        local json = cjson.decode(body)
+        assert.same({ message = "Method not allowed" }, json)
       end
     end)
 
@@ -73,7 +74,7 @@ describe("Admin API", function()
         it("retrieves a plugin by id", function()
           local res = assert(client:send {
             method = "GET",
-            path = "/plugins/"..plugins[1].id
+            path = "/plugins/" .. plugins[1].id
           })
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
@@ -93,7 +94,7 @@ describe("Admin API", function()
         it("updates a plugin", function()
           local res = assert(client:send {
             method = "PATCH",
-            path = "/plugins/"..plugins[1].id,
+            path = "/plugins/" .. plugins[1].id,
             body = {enabled = false},
             headers = {["Content-Type"] = "application/json"}
           })
@@ -112,7 +113,7 @@ describe("Admin API", function()
 
           local res = assert(client:send {
             method = "PATCH",
-            path = "/plugins/"..plugin.id,
+            path = "/plugins/" .. plugin.id,
             body = plugin,
             headers = {["Content-Type"] = "application/json"}
           })
@@ -137,7 +138,7 @@ describe("Admin API", function()
         it("deletes by id", function()
           local res = assert(client:send {
             method = "DELETE",
-            path = "/plugins/"..plugins[3].id
+            path = "/plugins/" .. plugins[3].id
           })
           assert.res_status(204, res)
         end)
@@ -171,7 +172,8 @@ describe("Admin API", function()
           path = "/plugins/schema/foobar",
         })
         local body = assert.res_status(404, res)
-        assert.equal([[{"message":"No plugin named 'foobar'"}]], body)
+        local json = cjson.decode(body)
+        assert.same({ message = "No plugin named 'foobar'" }, json)
       end)
     end)
   end)

@@ -24,11 +24,11 @@ Example usage:
  }
 
 Note:
- Third-party services such as Serf and dnsmasq need to be properly configured
+ Third-party services such as Serf need to be properly configured
  and started for Kong to be fully compatible while embedded.
 
 Options:
- -c,--conf (optional string) configuration file
+ -c,--conf     (optional string) configuration file
 ]]
 
 return {

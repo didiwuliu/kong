@@ -12,6 +12,9 @@ describe("NGINX conf compiler", function()
       ssl = true,
       ssl_cert = "spec/fixtures/kong_spec.crt",
       ssl_cert_key = "spec/fixtures/kong_spec.key",
+      admin_ssl = true,
+      admin_ssl_cert = "spec/fixtures/kong_spec.crt",
+      admin_ssl_cert_key = "spec/fixtures/kong_spec.key",
     }))
     before_each(function()
       helpers.dir.makepath("ssl_tmp")
@@ -19,18 +22,35 @@ describe("NGINX conf compiler", function()
     after_each(function()
       pcall(helpers.dir.rmtree, "ssl_tmp")
     end)
-    it("auto-generates SSL certificate and key", function()
-      assert(prefix_handler.gen_default_ssl_cert(conf))
-      assert(exists(conf.ssl_cert_default))
-      assert(exists(conf.ssl_cert_key_default))
+    describe("proxy", function()
+      it("auto-generates SSL certificate and key", function()
+        assert(prefix_handler.gen_default_ssl_cert(conf))
+        assert(exists(conf.ssl_cert_default))
+        assert(exists(conf.ssl_cert_key_default))
+      end)
+      it("does not re-generate if they already exist", function()
+        assert(prefix_handler.gen_default_ssl_cert(conf))
+        local cer = helpers.file.read(conf.ssl_cert_default)
+        local key = helpers.file.read(conf.ssl_cert_key_default)
+        assert(prefix_handler.gen_default_ssl_cert(conf))
+        assert.equal(cer, helpers.file.read(conf.ssl_cert_default))
+        assert.equal(key, helpers.file.read(conf.ssl_cert_key_default))
+      end)
     end)
-    it("does not re-generate if they already exist", function()
-      assert(prefix_handler.gen_default_ssl_cert(conf))
-      local cer = helpers.file.read(conf.ssl_cert_default)
-      local key = helpers.file.read(conf.ssl_cert_key_default)
-      assert(prefix_handler.gen_default_ssl_cert(conf))
-      assert.equal(cer, helpers.file.read(conf.ssl_cert_default))
-      assert.equal(key, helpers.file.read(conf.ssl_cert_key_default))
+    describe("admin", function()
+      it("auto-generates SSL certificate and key", function()
+        assert(prefix_handler.gen_default_ssl_cert(conf, true))
+        assert(exists(conf.admin_ssl_cert_default))
+        assert(exists(conf.admin_ssl_cert_key_default))
+      end)
+      it("does not re-generate if they already exist", function()
+        assert(prefix_handler.gen_default_ssl_cert(conf, true))
+        local cer = helpers.file.read(conf.admin_ssl_cert_default)
+        local key = helpers.file.read(conf.admin_ssl_cert_key_default)
+        assert(prefix_handler.gen_default_ssl_cert(conf, true))
+        assert.equal(cer, helpers.file.read(conf.admin_ssl_cert_default))
+        assert.equal(key, helpers.file.read(conf.admin_ssl_cert_key_default))
+      end)
     end)
   end)
 
@@ -60,7 +80,8 @@ describe("NGINX conf compiler", function()
     end)
     it("disables SSL", function()
       local conf = assert(conf_loader(helpers.test_conf_path, {
-        ssl = false
+        ssl = false,
+        admin_ssl = false
       }))
       local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
       assert.not_matches("listen %d+%.%d+%.%d+%.%d+:%d+ ssl;", kong_nginx_conf)
@@ -68,6 +89,26 @@ describe("NGINX conf compiler", function()
       assert.not_matches("ssl_certificate_key", kong_nginx_conf)
       assert.not_matches("ssl_protocols", kong_nginx_conf)
       assert.not_matches("ssl_certificate_by_lua_block", kong_nginx_conf)
+    end)
+    describe("handles client_ssl", function()
+      it("on", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          client_ssl = true,
+          client_ssl_cert = "spec/fixtures/kong_spec.crt",
+          client_ssl_cert_key = "spec/fixtures/kong_spec.key",
+        }))
+        local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+        assert.matches("proxy_ssl_certificate.*spec/fixtures/kong_spec.crt", kong_nginx_conf)
+        assert.matches("proxy_ssl_certificate_key.*spec/fixtures/kong_spec.key", kong_nginx_conf)
+      end)
+      it("off", function()
+        local conf = assert(conf_loader(helpers.test_conf_path, {
+          client_ssl = false,
+        }))
+        local kong_nginx_conf = prefix_handler.compile_kong_conf(conf)
+        assert.not_matches("proxy_ssl_certificate.*spec/fixtures/kong_spec.crt", kong_nginx_conf)
+        assert.not_matches("proxy_ssl_certificate_key.*spec/fixtures/kong_spec.key", kong_nginx_conf)
+      end)
     end)
     it("does not include lua_ssl_trusted_certificate/lua_ssl_verify_depth by default", function()
       local conf = assert(conf_loader(helpers.test_conf_path, {
@@ -99,6 +140,30 @@ describe("NGINX conf compiler", function()
       }))
       local nginx_conf = prefix_handler.compile_kong_conf(conf)
       assert.matches("error_log syslog:server=.+:61828 error;", nginx_conf)
+    end)
+    it("defines the client_max_body_size by default", function()
+      local conf = assert(conf_loader(nil, {}))
+      local nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("client_max_body_size 0", nginx_conf, nil, true)
+    end)
+    it("writes the client_max_body_size as defined", function()
+      local conf = assert(conf_loader(nil, {
+        client_max_body_size = "1m",
+      }))
+      local nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("client_max_body_size 1m", nginx_conf, nil, true)
+    end)
+    it("defines the client_body_buffer_size directive by default", function()
+      local conf = assert(conf_loader(nil, {}))
+      local nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("client_body_buffer_size 8k", nginx_conf, nil, true)
+    end)
+    it("writes the client_body_buffer_size directive as defined", function()
+      local conf = assert(conf_loader(nil, {
+        client_body_buffer_size = "128k",
+      }))
+      local nginx_conf = prefix_handler.compile_kong_conf(conf)
+      assert.matches("client_body_buffer_size 128k", nginx_conf, nil, true)
     end)
   end)
 
@@ -132,6 +197,14 @@ describe("NGINX conf compiler", function()
       assert.matches("worker_rlimit_nofile %d+;", nginx_conf)
       assert.matches("worker_connections %d+;", nginx_conf)
       assert.matches("multi_accept on;", nginx_conf)
+    end)
+    it("converts dns_resolver to string", function()
+      local nginx_conf = prefix_handler.compile_nginx_conf({
+        dns_resolver = { "8.8.8.8", "8.8.4.4" }
+      }, [[
+        "resolver ${{DNS_RESOLVER}} ipv6=off;"
+      ]])
+      assert.matches("resolver 8.8.8.8 8.8.4.4 ipv6=off;", nginx_conf, nil, true)
     end)
   end)
 
@@ -169,7 +242,7 @@ describe("NGINX conf compiler", function()
         prefix = tmp
       }))
       local ok, err = prefix_handler.prepare_prefix(config)
-      assert.equal(tmp.." is not a directory", err)
+      assert.equal(tmp .. " is not a directory", err)
       assert.is_nil(ok)
     end)
     it("creates pids folder", function()
@@ -182,14 +255,15 @@ describe("NGINX conf compiler", function()
     end)
     it("creates NGINX conf and log files", function()
       assert(prefix_handler.prepare_prefix(tmp_config))
-      assert.truthy(exists(tmp_config.kong_conf))
+      assert.truthy(exists(tmp_config.kong_env))
       assert.truthy(exists(tmp_config.nginx_kong_conf))
       assert.truthy(exists(tmp_config.nginx_err_logs))
       assert.truthy(exists(tmp_config.nginx_acc_logs))
+      assert.truthy(exists(tmp_config.nginx_admin_acc_logs))
     end)
     it("dumps Kong conf", function()
       assert(prefix_handler.prepare_prefix(tmp_config))
-      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_conf))
+      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_env))
       assert.same(tmp_config, in_prefix_kong_conf)
     end)
     it("dump Kong conf (custom conf)", function()
@@ -199,7 +273,7 @@ describe("NGINX conf compiler", function()
       }))
       assert.equal("foobar", conf.pg_database)
       assert(prefix_handler.prepare_prefix(conf))
-      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_conf))
+      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_env))
       assert.same(conf, in_prefix_kong_conf)
     end)
     it("writes custom plugins in Kong conf", function()
@@ -210,7 +284,7 @@ describe("NGINX conf compiler", function()
 
       assert(prefix_handler.prepare_prefix(conf))
 
-      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_conf))
+      local in_prefix_kong_conf = assert(conf_loader(tmp_config.kong_env))
       assert.True(in_prefix_kong_conf.plugins.foo)
       assert.True(in_prefix_kong_conf.plugins.bar)
     end)
@@ -241,7 +315,8 @@ describe("NGINX conf compiler", function()
       it("does not create SSL dir if disabled", function()
         local conf = conf_loader(nil, {
           prefix = tmp_config.prefix,
-          ssl = false
+          ssl = false,
+          admin_ssl = false
         })
 
         assert(prefix_handler.prepare_prefix(conf))
@@ -253,6 +328,9 @@ describe("NGINX conf compiler", function()
           ssl = true,
           ssl_cert = "spec/fixtures/kong_spec.crt",
           ssl_cert_key = "spec/fixtures/kong_spec.key",
+          admin_ssl = true,
+          admin_ssl_cert = "spec/fixtures/kong_spec.crt",
+          admin_ssl_cert_key = "spec/fixtures/kong_spec.key",
         })
 
         assert(prefix_handler.prepare_prefix(conf))
@@ -261,13 +339,16 @@ describe("NGINX conf compiler", function()
       it("generates default SSL cert", function()
         local conf = conf_loader(nil, {
           prefix = tmp_config.prefix,
-          ssl = true
+          ssl = true,
+          admin_ssl = true
         })
 
         assert(prefix_handler.prepare_prefix(conf))
         assert.truthy(exists(join(conf.prefix, "ssl")))
         assert.truthy(exists(conf.ssl_cert_default))
         assert.truthy(exists(conf.ssl_cert_key_default))
+        assert.truthy(exists(conf.admin_ssl_cert_default))
+        assert.truthy(exists(conf.admin_ssl_cert_key_default))
       end)
     end)
 

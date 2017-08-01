@@ -1,24 +1,51 @@
 local events = require "kong.core.events"
 local cache = require "kong.tools.database_cache"
 local utils = require "kong.tools.utils"
+local balancer = require "kong.core.balancer"
 local singletons = require "kong.singletons"
 local pl_stringx = require "pl.stringx"
-
-local function invalidate_plugin(entity)
-  cache.delete(cache.plugin_key(entity.name, entity.api_id, entity.consumer_id))
-end
 
 local function invalidate(message_t)
   if message_t.collection == "consumers" then
     cache.delete(cache.consumer_key(message_t.entity.id))
-  elseif message_t.collection == "apis" then
-    if message_t.entity then
-      cache.delete(cache.api_key(message_t.entity.id))
-    end
-    cache.delete(cache.all_apis_by_dict_key())
+
   elseif message_t.collection == "plugins" then
     -- Handles both the update and the delete
-    invalidate_plugin(message_t.old_entity and message_t.old_entity or message_t.entity)
+    local entity = message_t.old_entity
+    if not entity then
+      entity = message_t.entity
+    end
+
+    cache.delete(cache.plugin_key(entity.name, entity.api_id, entity.consumer_id))
+
+  elseif message_t.collection == "targets" then
+    -- targets only append new entries, we're not changing anything
+    -- but we need to reload the related upstreams target-history, so invalidate
+    -- that instead of the target
+    cache.delete(cache.targets_key(message_t.entity.upstream_id))
+
+  elseif message_t.collection == "upstreams" then
+    --we invalidate the list, the individual upstream, and its target history
+    cache.delete(cache.upstreams_dict_key())
+    cache.delete(cache.upstream_key(message_t.entity.id))
+    cache.delete(cache.targets_key(message_t.entity.id))
+    balancer.invalidate_balancer(message_t.entity.name)
+
+  elseif message_t.collection == "ssl_certificates" then
+    -- Handles both the update and the delete
+    local entity = message_t.old_entity
+    if not entity then
+      entity = message_t.entity
+    end
+
+    if type(entity.snis) == "table" then
+      for i = 1, #entity.snis do
+        cache.delete(cache.certificate_key(entity.snis[i]))
+      end
+    end
+
+  elseif message_t.collection == "ssl_servers_names" then
+    cache.delete(cache.certificate_key(message_t.entity.name))
   end
 end
 
@@ -128,7 +155,7 @@ local function member_join(s_node)
   if #nodes == 1 then -- Update
     member_update(s_node)
   elseif #nodes > 1 then
-    error("Inconsistency error. More than one node found with name "..member.name)
+    error("Inconsistency error. More than one node found with name " .. member.name)
   end
 
   -- Purge the cache when a new node joins

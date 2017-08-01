@@ -38,7 +38,7 @@ describe("Admin API", function()
         assert.is_nil(res.headers.via) -- Via is only set for proxied requests
       end)
       it("returns 405 on invalid method", function()
-        local methods = {"POST", "PUT", "DELETE", "PATCH"}
+        local methods = {"POST", "PUT", "DELETE", "PATCH", "GEEEET"}
         for i = 1, #methods do
           local res = assert(client:send {
             method = methods[i],
@@ -47,7 +47,8 @@ describe("Admin API", function()
             headers = {["Content-Type"] = "application/json"}
           })
           local body = assert.response(res).has.status(405)
-          assert.equal([[{"message":"Method not allowed"}]], body)
+          local json = cjson.decode(body)
+          assert.same({ message = "Method not allowed" }, json)
         end
       end)
       it("exposes the node's configuration", function()

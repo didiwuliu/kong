@@ -17,7 +17,7 @@ local ANSWERS = {
 local function confirm(q)
   local max = 3
   while max > 0 do
-    io.write("> "..q.." [Y/n] ")
+    io.write("> " .. q .. " [Y/n] ")
     local a = io.read("*l")
     if ANSWERS[a] ~= nil then
       return ANSWERS[a]
@@ -28,7 +28,7 @@ end
 
 local function execute(args)
   local conf = assert(conf_loader(args.conf))
-  local dao = DAOFactory(conf, conf.plugins)
+  local dao = assert(DAOFactory.new(conf))
 
   if args.command == "up" then
     assert(dao:run_migrations())
@@ -66,7 +66,7 @@ The available commands are:
  reset  Reset the configured database (irreversible).
 
 Options:
- -c,--conf (optional string) configuration file
+ -c,--conf     (optional string) configuration file
 ]]
 
 return {

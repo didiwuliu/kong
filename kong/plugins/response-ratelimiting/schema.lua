@@ -12,11 +12,11 @@ local function check_ordered_limits(limit_value)
     if limit_value[v] then
       has_value = true
       if limit_value[v] <=0 then
-        invalid_value = "Value for "..v.." must be greater than zero"
+        invalid_value = "Value for " .. v .. " must be greater than zero"
       else
-        for t = i, #ordered_periods do
+        for t = i+1, #ordered_periods do
           if limit_value[ordered_periods[t]] and limit_value[ordered_periods[t]] < limit_value[v] then
-            invalid_order = "The limit for "..ordered_periods[t].." cannot be lower than the limit for "..v
+            invalid_order = "The limit for " .. ordered_periods[t] .. " cannot be lower than the limit for " .. v
           end
         end
       end
@@ -44,6 +44,7 @@ return {
     redis_port = { type = "number", default = 6379 },
     redis_password = { type = "string" },
     redis_timeout = { type = "number", default = 2000 },
+    redis_database = { type = "number", default = 0 },
     block_on_first_violation = { type = "boolean", default = false},
     limits = { type = "table",
       schema = {

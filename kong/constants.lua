@@ -1,9 +1,32 @@
 local plugins = {
-  "ssl", "jwt", "acl", "correlation-id", "cors", "oauth2", "tcp-log", "udp-log",
-  "file-log", "http-log", "key-auth", "hmac-auth", "basic-auth", "ip-restriction",
-  "galileo", "request-transformer", "response-transformer",
-  "request-size-limiting", "rate-limiting", "response-ratelimiting", "syslog",
-  "loggly", "datadog", "runscope", "ldap-auth", "statsd", "bot-detection"
+  "jwt",
+  "acl",
+  "correlation-id",
+  "cors",
+  "oauth2",
+  "tcp-log",
+  "udp-log",
+  "file-log",
+  "http-log",
+  "key-auth",
+  "hmac-auth",
+  "basic-auth",
+  "ip-restriction",
+  "galileo",
+  "request-transformer",
+  "response-transformer",
+  "request-size-limiting",
+  "rate-limiting",
+  "response-ratelimiting",
+  "syslog",
+  "loggly",
+  "datadog",
+  "runscope",
+  "ldap-auth",
+  "statsd",
+  "bot-detection",
+  "aws-lambda",
+  "request-termination",
 }
 
 local plugin_map = {}
@@ -26,7 +49,8 @@ return {
     RATELIMIT_REMAINING = "X-RateLimit-Remaining",
     CONSUMER_GROUPS = "X-Consumer-Groups",
     FORWARDED_HOST = "X-Forwarded-Host",
-    FORWARDED_PREFIX = "X-Forwarded-Prefix"
+    FORWARDED_PREFIX = "X-Forwarded-Prefix",
+    ANONYMOUS = "X-Anonymous-Consumer"
   },
   RATELIMIT = {
     PERIODS = {
@@ -38,8 +62,13 @@ return {
       "year"
     }
   },
-  SYSLOG = {
+  REPORTS = {
     ADDRESS = "kong-hf.mashape.com",
-    PORT = 61828
-  }
+    SYSLOG_PORT = 61828,
+    STATS_PORT = 61829
+  },
+  CACHE = {
+    CLUSTER = "cluster"
+  },
+  DICTS = { "kong", "cache", "cache_locks", "process_events", "cassandra"},
 }

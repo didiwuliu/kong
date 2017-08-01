@@ -1,13 +1,11 @@
 return [[
-resolver ${{DNS_RESOLVER}} ipv6=off;
 charset UTF-8;
-
-error_log logs/error.log ${{LOG_LEVEL}};
-access_log logs/access.log;
 
 > if anonymous_reports then
 ${{SYSLOG_REPORTS}}
 > end
+
+error_log ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
 
 > if nginx_optimizations then
 >-- send_timeout 60s;          # default value
@@ -21,7 +19,7 @@ ${{SYSLOG_REPORTS}}
 >-- reset_timedout_connection on; # disabled until benchmarked
 > end
 
-client_max_body_size 0;
+client_max_body_size ${{CLIENT_MAX_BODY_SIZE}};
 proxy_ssl_server_name on;
 underscores_in_headers on;
 
@@ -32,13 +30,14 @@ real_ip_recursive on;
 lua_package_path '${{LUA_PACKAGE_PATH}};;';
 lua_package_cpath '${{LUA_PACKAGE_CPATH}};;';
 lua_code_cache ${{LUA_CODE_CACHE}};
+lua_socket_pool_size ${{LUA_SOCKET_POOL_SIZE}};
 lua_max_running_timers 4096;
 lua_max_pending_timers 16384;
 lua_shared_dict kong 4m;
 lua_shared_dict cache ${{MEM_CACHE_SIZE}};
 lua_shared_dict cache_locks 100k;
-lua_shared_dict cassandra 1m;
-lua_shared_dict cassandra_prepared 5m;
+lua_shared_dict process_events 1m;
+lua_shared_dict cassandra 5m;
 lua_socket_log_errors off;
 > if lua_ssl_trusted_certificate then
 lua_ssl_trusted_certificate '${{LUA_SSL_TRUSTED_CERTIFICATE}}';
@@ -46,6 +45,7 @@ lua_ssl_verify_depth ${{LUA_SSL_VERIFY_DEPTH}};
 > end
 
 init_by_lua_block {
+    require 'luarocks.loader'
     require 'resty.core'
     kong = require 'kong'
     kong.init()
@@ -55,36 +55,82 @@ init_worker_by_lua_block {
     kong.init_worker()
 }
 
+proxy_next_upstream_tries 999;
+
+upstream kong_upstream {
+    server 0.0.0.1;
+    balancer_by_lua_block {
+        kong.balancer()
+    }
+    keepalive ${{UPSTREAM_KEEPALIVE}};
+}
+
+map $http_upgrade $upstream_connection {
+    default keep-alive;
+    websocket upgrade;
+}
+
+map $http_upgrade $upstream_upgrade {
+    default '';
+    websocket websocket;
+}
+
 server {
     server_name kong;
     listen ${{PROXY_LISTEN}};
     error_page 404 408 411 412 413 414 417 /kong_error_handler;
     error_page 500 502 503 504 /kong_error_handler;
 
+    access_log ${{PROXY_ACCESS_LOG}};
+    error_log ${{PROXY_ERROR_LOG}} ${{LOG_LEVEL}};
+
+    client_body_buffer_size ${{CLIENT_BODY_BUFFER_SIZE}};
+
 > if ssl then
     listen ${{PROXY_LISTEN_SSL}} ssl;
     ssl_certificate ${{SSL_CERT}};
     ssl_certificate_key ${{SSL_CERT_KEY}};
-    ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+    ssl_protocols TLSv1.1 TLSv1.2;
     ssl_certificate_by_lua_block {
         kong.ssl_certificate()
     }
+
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ${{SSL_CIPHERS}};
+> end
+
+> if client_ssl then
+    proxy_ssl_certificate ${{CLIENT_SSL_CERT}};
+    proxy_ssl_certificate_key ${{CLIENT_SSL_CERT_KEY}};
 > end
 
     location / {
         set $upstream_host nil;
-        set $upstream_url nil;
+        set $upstream_scheme nil;
+        set $upstream_uri nil;
+
+        rewrite_by_lua_block {
+            kong.rewrite()
+        }
 
         access_by_lua_block {
             kong.access()
         }
 
+        proxy_http_version 1.1;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Host $upstream_host;
+        proxy_set_header Upgrade $upstream_upgrade;
+        proxy_set_header Connection $upstream_connection;
         proxy_pass_header Server;
-        proxy_pass $upstream_url;
+
+        proxy_ssl_name $upstream_host;
+
+        proxy_pass $upstream_scheme://kong_upstream$upstream_uri;
 
         header_filter_by_lua_block {
             kong.header_filter()
@@ -111,13 +157,29 @@ server {
     server_name kong_admin;
     listen ${{ADMIN_LISTEN}};
 
+    access_log ${{ADMIN_ACCESS_LOG}};
+    error_log ${{ADMIN_ERROR_LOG}} ${{LOG_LEVEL}};
+
     client_max_body_size 10m;
     client_body_buffer_size 10m;
+
+> if admin_ssl then
+    listen ${{ADMIN_LISTEN_SSL}} ssl;
+    ssl_certificate ${{ADMIN_SSL_CERT}};
+    ssl_certificate_key ${{ADMIN_SSL_CERT_KEY}};
+    ssl_protocols TLSv1.1 TLSv1.2;
+
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ${{SSL_CIPHERS}};
+> end
 
     location / {
         default_type application/json;
         content_by_lua_block {
             ngx.header['Access-Control-Allow-Origin'] = '*'
+
             if ngx.req.get_method() == 'OPTIONS' then
                 ngx.header['Access-Control-Allow-Methods'] = 'GET,HEAD,PUT,PATCH,POST,DELETE'
                 ngx.header['Access-Control-Allow-Headers'] = 'Content-Type'
