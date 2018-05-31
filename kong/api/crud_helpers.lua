@@ -53,16 +53,29 @@ end
 
 function _M.find_api_by_name_or_id(self, dao_factory, helpers)
   local rows, err = _M.find_by_id_or_field(dao_factory.apis, {},
-                                           self.params.name_or_id, "name")
+                                           self.params.api_name_or_id, "name")
 
   if err then
     return helpers.yield_error(err)
   end
-  self.params.name_or_id = nil
+  self.params.api_name_or_id = nil
 
   -- We know name and id are unique for APIs, hence if we have a row, it must be the only one
   self.api = rows[1]
   if not self.api then
+    return helpers.responses.send_HTTP_NOT_FOUND()
+  end
+end
+
+function _M.find_plugin_by_filter(self, dao_factory, filter, helpers)
+  local rows, err = dao_factory.plugins:find_all(filter)
+  if err then
+    return helpers.yield_error(err)
+  end
+
+  -- We know the id is unique, so if we have a row, it must be the only one
+  self.plugin = rows[1]
+  if not self.plugin then
     return helpers.responses.send_HTTP_NOT_FOUND()
   end
 end
@@ -85,12 +98,12 @@ end
 
 function _M.find_upstream_by_name_or_id(self, dao_factory, helpers)
   local rows, err = _M.find_by_id_or_field(dao_factory.upstreams, {},
-                                           self.params.name_or_id, "name")
+                                           self.params.upstream_name_or_id, "name")
 
   if err then
     return helpers.yield_error(err)
   end
-  self.params.name_or_id = nil
+  self.params.upstream_name_or_id = nil
 
   -- We know name and id are unique, so if we have a row, it must be the only one
   self.upstream = rows[1]
@@ -102,16 +115,13 @@ end
 -- this function will return the exact target if specified by `id`, or just
 -- 'any target entry' if specified by target (= 'hostname:port')
 function _M.find_target_by_target_or_id(self, dao_factory, helpers)
-  local filter_keys = {
-    upstream_id = self.upstream.id,
-    [utils.is_valid_uuid(self.params.target_or_id) and "id" or "target"] = self.params.target_or_id
-  }
-  self.params.target_or_id = nil
+  local rows, err = _M.find_by_id_or_field(dao_factory.targets, {},
+                                           self.params.target_or_id, "target")
 
-  local rows, err = dao_factory.targets:find_all(filter_keys)
   if err then
     return helpers.yield_error(err)
   end
+  self.params.target_or_id = nil
 
   -- if looked up by `target` property we can have multiple targets here, but
   -- anyone will do as they all have the same 'target' field, so just pick
@@ -153,21 +163,11 @@ function _M.paginated_set(self, dao_collection, post_process)
     })
   end
 
-  local data
+  local data = setmetatable(rows, cjson.empty_array_mt)
 
-  if #rows == 0 then
-    -- FIXME: remove and stick to previous `empty_array_mt` metatable
-    -- assignment once https://github.com/openresty/lua-cjson/pull/16
-    -- is included in the OpenResty release we use.
-    data = cjson.empty_array
-
-  else
-    data = rows
-
-    if type(post_process) == "function" then
-      for i, row in ipairs(rows) do
-        data[i] = post_process(row)
-      end
+  if type(post_process) == "function" then
+    for i, row in ipairs(rows) do
+      data[i] = post_process(row)
     end
   end
 
@@ -193,7 +193,7 @@ function _M.get(primary_keys, dao_collection, post_process)
 end
 
 --- Insertion of an entity.
-function _M.post(params, dao_collection, success, post_process)
+function _M.post(params, dao_collection, post_process)
   local data, err = dao_collection:insert(params)
   if err then
     return app_helpers.yield_error(err)
@@ -235,6 +235,10 @@ function _M.put(params, dao_collection, post_process)
     -- If entity body has primary key, deal with update
     new_entity, err = dao_collection:update(params, params, {full = true})
     if not err then
+      if not new_entity then
+        return responses.send_HTTP_NOT_FOUND()
+      end
+
       return responses.send_HTTP_OK(post_process_row(new_entity, post_process))
     end
   end

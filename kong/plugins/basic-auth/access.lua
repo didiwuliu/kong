@@ -1,5 +1,3 @@
-local utils = require "kong.tools.utils"
-local cache = require "kong.tools.database_cache"
 local crypto = require "kong.plugins.basic-auth.crypto"
 local singletons = require "kong.singletons"
 local constants = require "kong.constants"
@@ -7,6 +5,7 @@ local responses = require "kong.tools.responses"
 
 local ngx_set_header = ngx.req.set_header
 local ngx_get_headers = ngx.req.get_headers
+local ngx_re_match = ngx.re.match
 
 local realm = 'Basic realm="' .. _KONG._NAME .. '"'
 
@@ -40,7 +39,18 @@ local function retrieve_credentials(request, header_name, conf)
     if m and m[1] then
       local decoded_basic = ngx.decode_base64(m[1])
       if decoded_basic then
-        local basic_parts = utils.split(decoded_basic, ":")
+        local basic_parts, err = ngx_re_match(decoded_basic,
+                                              "([^:]+):(.*)", "oj")
+        if err then
+          ngx.log(ngx.ERR, err)
+          return
+        end
+
+        if not basic_parts then
+          ngx.log(ngx.ERR, "[basic-auth] header has unrecognized format")
+          return
+        end
+
         username = basic_parts[1]
         password = basic_parts[2]
       end
@@ -78,9 +88,11 @@ local function load_credential_from_db(username)
   if not username then
     return
   end
-  
-  local credential, err = cache.get_or_set(cache.basicauth_credential_key(username),
-                          nil, load_credential_into_memory, username)
+
+  local credential_cache_key = singletons.dao.basicauth_credentials:cache_key(username)
+  local credential, err      = singletons.cache:get(credential_cache_key, nil,
+                                                    load_credential_into_memory,
+                                                    username)
   if err then
     return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
   end
@@ -110,7 +122,7 @@ local function set_consumer(consumer, credential)
   else
     ngx_set_header(constants.HEADERS.ANONYMOUS, true)
   end
-  
+
 end
 
 local function do_authentication(conf)
@@ -138,8 +150,10 @@ local function do_authentication(conf)
   end
 
   -- Retrieve consumer
-  local consumer, err = cache.get_or_set(cache.consumer_key(credential.consumer_id),
-                   nil, load_consumer_into_memory, credential.consumer_id, false)
+  local consumer_cache_key = singletons.dao.consumers:cache_key(credential.consumer_id)
+  local consumer, err      = singletons.cache:get(consumer_cache_key, nil,
+                                                  load_consumer_into_memory,
+                                                  credential.consumer_id)
   if err then
     return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
   end
@@ -153,17 +167,19 @@ end
 function _M.execute(conf)
 
   if ngx.ctx.authenticated_credential and conf.anonymous ~= "" then
-    -- we're already authenticated, and we're configured for using anonymous, 
+    -- we're already authenticated, and we're configured for using anonymous,
     -- hence we're in a logical OR between auth methods and we're already done.
     return
   end
 
   local ok, err = do_authentication(conf)
   if not ok then
-    if conf.anonymous ~= "" and conf.anonymous ~= nil then
+    if conf.anonymous ~= "" then
       -- get anonymous user
-      local consumer, err = cache.get_or_set(cache.consumer_key(conf.anonymous),
-                       nil, load_consumer_into_memory, conf.anonymous, true)
+      local consumer_cache_key = singletons.dao.consumers:cache_key(conf.anonymous)
+      local consumer, err      = singletons.cache:get(consumer_cache_key, nil,
+                                                      load_consumer_into_memory,
+                                                      conf.anonymous, true)
       if err then
         return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
       end

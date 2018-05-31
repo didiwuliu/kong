@@ -9,6 +9,7 @@ local pl_path = require "pl.path"
 local tablex = require "pl.tablex"
 local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
+local ip = require "kong.tools.ip"
 local ciphers = require "kong.tools.ciphers"
 
 local DEFAULT_PATHS = {
@@ -17,11 +18,6 @@ local DEFAULT_PATHS = {
 }
 
 local PREFIX_PATHS = {
-  serf_pid = {"pids", "serf.pid"},
-  serf_log = {"logs", "serf.log"},
-  serf_event = {"serf", "serf_event.sh"},
-  serf_node_id = {"serf", "serf.id"}
-  ;
   nginx_pid = {"pids", "nginx.pid"},
   nginx_err_logs = {"logs", "error.log"},
   nginx_acc_logs = {"logs", "access.log"},
@@ -57,22 +53,23 @@ local PREFIX_PATHS = {
 -- `array`: a comma-separated list
 local CONF_INFERENCES = {
   -- forced string inferences (or else are retrieved as numbers)
-  proxy_listen = {typ = "string"},
-  proxy_listen_ssl = {typ = "string"},
-  admin_listen = {typ = "string"},
-  admin_listen_ssl = {typ = "string"},
-  cluster_listen = {typ = "string"},
-  cluster_listen_rpc = {typ = "string"},
-  cluster_advertise = {typ = "string"},
+  proxy_listen = {typ = "array"},
+  admin_listen = {typ = "array"},
+  db_update_frequency = { typ = "number" },
+  db_update_propagation = { typ = "number" },
+  db_cache_ttl = { typ = "number" },
+  nginx_user = {typ = "string"},
   nginx_worker_processes = {typ = "string"},
   upstream_keepalive = {typ = "number"},
   server_tokens = {typ = "boolean"},
   latency_tokens = {typ = "boolean"},
-  error_default_type = {enum = {"application/json", "application/xml",
-                                "text/html", "text/plain"}},
+  trusted_ips = {typ = "array"},
+  real_ip_header = {typ = "string"},
+  real_ip_recursive = {typ = "ngx_boolean"},
   client_max_body_size = {typ = "string"},
   client_body_buffer_size = {typ = "string"},
-
+  error_default_type = {enum = {"application/json", "application/xml",
+                                "text/html", "text/plain"}},
 
   database = {enum = {"postgres", "cassandra"}},
   pg_port = {typ = "number"},
@@ -95,14 +92,15 @@ local CONF_INFERENCES = {
   cassandra_data_centers = {typ = "array"},
   cassandra_schema_consensus_timeout = {typ = "number"},
 
-  cluster_profile = {enum = {"local", "lan", "wan"}},
-  cluster_ttl_on_failure = {typ = "number"},
-
   dns_resolver = {typ = "array"},
+  dns_hostsfile = {typ = "string"},
+  dns_order = {typ = "array"},
+  dns_stale_ttl = {typ = "number"},
+  dns_not_found_ttl = {typ = "number"},
+  dns_error_ttl = {typ = "number"},
+  dns_no_sync = {typ = "boolean"},
 
-  ssl = {typ = "boolean"},
   client_ssl = {typ = "boolean"},
-  admin_ssl = {typ = "boolean"},
 
   proxy_access_log = {typ = "string"},
   proxy_error_log = {typ = "string"},
@@ -115,7 +113,6 @@ local CONF_INFERENCES = {
   nginx_daemon = {typ = "ngx_boolean"},
   nginx_optimizations = {typ = "boolean"},
 
-  lua_code_cache = {typ = "ngx_boolean"},
   lua_ssl_verify_depth = {typ = "number"},
   lua_socket_pool_size = {typ = "number"},
 }
@@ -125,7 +122,6 @@ local CONF_INFERENCES = {
 local CONF_SENSITIVE = {
   pg_password = true,
   cassandra_password = true,
-  cluster_encrypt_key = true
 }
 
 local CONF_SENSITIVE_PLACEHOLDER = "******"
@@ -148,7 +144,12 @@ local function check_and_infer(conf)
     local typ = v_schema.typ
 
     if type(value) == "string" then
-      value = string.gsub(value, "#.-$", "") -- remove trailing comment if any
+
+      -- remove trailing comment, if any
+      -- and remove escape chars from octothorpes
+      value = string.gsub(value, "[^\\]#.-$", "")
+      value = string.gsub(value, "\\#", "#")
+
       value = pl_stringx.strip(value)
     end
 
@@ -195,25 +196,35 @@ local function check_and_infer(conf)
   -- custom validations
   ---------------------
 
-  if conf.cassandra_lb_policy == "DCAwareRoundRobin" and
-     not conf.cassandra_local_datacenter then
-     errors[#errors+1] = "must specify 'cassandra_local_datacenter' when " ..
-                        "DCAwareRoundRobin policy is in use"
-  end
+  if conf.database == "cassandra" then
+    if conf.cassandra_lb_policy == "DCAwareRoundRobin" and
+      not conf.cassandra_local_datacenter then
+      errors[#errors+1] = "must specify 'cassandra_local_datacenter' when " ..
+      "DCAwareRoundRobin policy is in use"
+    end
 
-  for _, contact_point in ipairs(conf.cassandra_contact_points) do
-    local endpoint, err = utils.normalize_ip(contact_point)
-    if not endpoint then
-      errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
-                          "': " .. err
+    for _, contact_point in ipairs(conf.cassandra_contact_points) do
+      local endpoint, err = utils.normalize_ip(contact_point)
+      if not endpoint then
+        errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
+        "': " .. err
 
-    elseif endpoint.port then
-      errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
-                          "': port must be specified in cassandra_port"
+      elseif endpoint.port then
+        errors[#errors+1] = "bad cassandra contact point '" .. contact_point ..
+        "': port must be specified in cassandra_port"
+      end
+    end
+
+    -- cache settings check
+
+    if conf.db_update_propagation == 0 then
+      log.warn("You are using Cassandra but your 'db_update_propagation' " ..
+               "setting is set to '0' (default). Due to the distributed "  ..
+               "nature of Cassandra, you should increase this value.")
     end
   end
 
-  if conf.ssl then
+  if (table.concat(conf.proxy_listen, ",") .. " "):find("%sssl[%s,]") then
     if conf.ssl_cert and not conf.ssl_cert_key then
       errors[#errors+1] = "ssl_cert_key must be specified"
     elseif conf.ssl_cert_key and not conf.ssl_cert then
@@ -243,7 +254,7 @@ local function check_and_infer(conf)
     end
   end
 
-  if conf.admin_ssl then
+  if (table.concat(conf.admin_listen, ",") .. " "):find("%sssl[%s,]") then
     if conf.admin_ssl_cert and not conf.admin_ssl_cert_key then
       errors[#errors+1] = "admin_ssl_cert_key must be specified"
     elseif conf.admin_ssl_cert_key and not conf.admin_ssl_cert then
@@ -270,30 +281,39 @@ local function check_and_infer(conf)
   if conf.dns_resolver then
     for _, server in ipairs(conf.dns_resolver) do
       local dns = utils.normalize_ip(server)
-      if not dns or dns.type ~= "ipv4" then
+      if not dns or dns.type == "name" then
         errors[#errors+1] = "dns_resolver must be a comma separated list in " ..
-                            "the form of IPv4 or IPv4:port, got '" .. server .. "'"
+                            "the form of IPv4/6 or IPv4/6:port, got '" .. server .. "'"
       end
     end
   end
 
-  local ip, port = utils.normalize_ipv4(conf.cluster_listen)
-  if not (ip and port) then
-    errors[#errors+1] = "cluster_listen must be in the form of IPv4:port"
+  if conf.dns_hostsfile then
+    if not pl_path.isfile(conf.dns_hostsfile) then
+      errors[#errors+1] = "dns_hostsfile: file does not exist"
+    end
   end
-  ip, port = utils.normalize_ipv4(conf.cluster_listen_rpc)
-  if not (ip and port) then
-    errors[#errors+1] = "cluster_listen_rpc must be in the form of IPv4:port"
+
+  if conf.dns_order then
+    local allowed = { LAST = true, A = true, CNAME = true, SRV = true }
+    for _, name in ipairs(conf.dns_order) do
+      if not allowed[name:upper()] then
+        errors[#errors+1] = "dns_order: invalid entry '" .. tostring(name) .. "'"
+      end
+    end
   end
-  ip, port = utils.normalize_ipv4(conf.cluster_advertise or "")
-  if conf.cluster_advertise and not (ip and port) then
-    errors[#errors+1] = "cluster_advertise must be in the form of IPv4:port"
-  end
-  if conf.cluster_ttl_on_failure < 60 then
-    errors[#errors+1] = "cluster_ttl_on_failure must be at least 60 seconds"
-  end
+
   if not conf.lua_package_cpath then
     conf.lua_package_cpath = ""
+  end
+
+  -- Checking the trusted ips
+  for _, address in ipairs(conf.trusted_ips) do
+    if not ip.valid(address) and not address == "unix:" then
+      errors[#errors+1] = "trusted_ips must be a comma separated list in "..
+                          "the form of IPv4 or IPv6 address or CIDR "..
+                          "block or 'unix:', got '" .. address .. "'"
+    end
   end
 
   return #errors == 0, errors[1], errors
@@ -329,6 +349,85 @@ local function overrides(k, default_v, file_conf, arg_conf)
   end
 
   return value, k
+end
+
+-- @param value The options string to check for flags (whitespace separated)
+-- @param flags List of boolean flags to check for.
+-- @returns 1) remainder string after all flags removed, 2) table with flag
+-- booleans, 3) sanitized flags string
+local function parse_option_flags(value, flags)
+  assert(type(value) == "string")
+
+  value = " " .. value .. " "
+
+  local sanitized = ""
+  local result = {}
+
+  for _, flag in ipairs(flags) do
+    local count
+    local patt = "%s" .. flag .. "%s"
+
+    value, count = value:gsub(patt, " ")
+
+    if count > 0 then
+      result[flag] = true
+      sanitized = sanitized .. " " .. flag
+
+    else
+      result[flag] = false
+    end
+  end
+
+  return pl_stringx.strip(value), result, pl_stringx.strip(sanitized)
+end
+
+-- Parses a listener address line.
+-- Supports multiple (comma separated) addresses, with 'ssl' and 'http2' flags.
+-- Pre- and postfixed whitespace as well as comma's are allowed.
+-- "off" as a first entry will return empty tables.
+-- @value list of entries (strings)
+-- @return list of parsed entries, each entry having fields `ip` (normalized string)
+-- `port` (number), `ssl` (bool), `http2` (bool), `listener` (string, full listener)
+local function parse_listeners(values)
+  local list = {}
+  local flags = { "ssl", "http2", "proxy_protocol" }
+  local usage = "must be of form: [off] | <ip>:<port> [" ..
+                table.concat(flags, "] [") .. "], [... next entry ...]"
+
+  if pl_stringx.strip(values[1]) == "off" then
+    return list
+  end
+
+  for _, entry in ipairs(values) do
+    -- parse the flags
+    local remainder, listener, cleaned_flags = parse_option_flags(entry, flags)
+
+    -- verify IP for remainder
+    local ip
+
+    if utils.hostname_type(remainder) == "name" then
+      -- it's not an IP address, so a name/wildcard/regex
+      ip = {}
+      ip.host, ip.port = remainder:match("(.+):([%d]+)$")
+
+    else
+      -- It's an IPv4 or IPv6, just normalize it
+      ip = utils.normalize_ip(remainder)
+    end
+
+    if not ip or not ip.port then
+      return nil, usage
+    end
+
+    listener.ip = ip.host
+    listener.port = ip.port
+    listener.listener = ip.host .. ":" .. ip.port ..
+                        (#cleaned_flags == 0 and "" or " " .. cleaned_flags)
+
+    table.insert(list, listener)
+  end
+
+  return list
 end
 
 --- Load Kong configuration
@@ -442,25 +541,50 @@ local function load(path, custom_conf)
     setmetatable(conf.plugins, nil) -- remove Map mt
   end
 
+  -- nginx user directive
+  do
+    local user = conf.nginx_user:gsub("^%s*", ""):gsub("%s$", ""):gsub("%s+", " ")
+    if user == "nobody" or user == "nobody nobody" then
+      conf.nginx_user = nil
+    end
+  end
+
   -- extract ports/listen ips
   do
-    local ip_port_pat = "(.+):([%d]+)$"
-    local admin_ip, admin_port = string.match(conf.admin_listen, ip_port_pat)
-    local admin_ssl_ip, admin_ssl_port = string.match(conf.admin_listen_ssl, ip_port_pat)
-    local proxy_ip, proxy_port = string.match(conf.proxy_listen, ip_port_pat)
-    local proxy_ssl_ip, proxy_ssl_port = string.match(conf.proxy_listen_ssl, ip_port_pat)
+    local err
+    -- this meta table will prevent the parsed table to be passed on in the
+    -- intermediate Kong config file in the prefix directory
+    local mt = { __tostring = function() return "" end }
 
-    if not admin_port then return nil, "admin_listen must be of form 'address:port'"
-    elseif not proxy_port then return nil, "proxy_listen must be of form 'address:port'"
-    elseif not proxy_ssl_port then return nil, "proxy_listen_ssl must be of form 'address:port'" end
-    conf.admin_ip = admin_ip
-    conf.admin_ssl_ip = admin_ssl_ip
-    conf.proxy_ip = proxy_ip
-    conf.proxy_ssl_ip = proxy_ssl_ip
-    conf.admin_port = tonumber(admin_port)
-    conf.admin_ssl_port = tonumber(admin_ssl_port)
-    conf.proxy_port = tonumber(proxy_port)
-    conf.proxy_ssl_port = tonumber(proxy_ssl_port)
+    conf.proxy_listeners, err = parse_listeners(conf.proxy_listen)
+    if err then
+      return nil, "proxy_listen " .. err
+    end
+
+    setmetatable(conf.proxy_listeners, mt)  -- do not pass on, parse again
+    conf.proxy_ssl_enabled = false
+
+    for _, listener in ipairs(conf.proxy_listeners) do
+      if listener.ssl == true then
+        conf.proxy_ssl_enabled = true
+        break
+      end
+    end
+
+    conf.admin_listeners, err = parse_listeners(conf.admin_listen)
+    if err then
+      return nil, "admin_listen " .. err
+    end
+
+    setmetatable(conf.admin_listeners, mt)  -- do not pass on, parse again
+    conf.admin_ssl_enabled = false
+
+    for _, listener in ipairs(conf.admin_listeners) do
+      if listener.ssl == true then
+        conf.admin_ssl_enabled = true
+        break
+      end
+    end
   end
 
   -- load absolute paths

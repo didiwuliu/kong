@@ -24,6 +24,7 @@ Consult the Table of Contents below, and jump to the desired section.
     - [Static linting](#static-linting)
     - [Writing tests](#writing-tests)
     - [Writing performant code](#writing-performant-code)
+  - [Contributor T-shirt](#contributor-t-shirt)
 - [Code style](#code-style)
 
 
@@ -33,15 +34,15 @@ Consult the Table of Contents below, and jump to the desired section.
 
 If you are a Kong Enterprise customer, contact the Enterprise Support channels
 by opening an Enterprise support ticket on
-[https://support.mashape.com](https://support.mashape.com/).
+[https://support.konghq.com](https://support.konghq.com/).
 
 If you are experiencing a P1 issue, please call the [24/7 Enterprise Support
-phone line](https://support.mashape.com/hc/en-us/articles/115004921808-Telephone-Support)
+phone line](https://support.konghq.com/hc/en-us/articles/115004921808-Telephone-Support)
 for immediate assistance, as published in the Customer Success Reference Guide.
 
 If you are interested in becoming a Kong Enterprise customer, please visit
-https://www.mashape.com/enterprise/ or contact us at
-[sales@mashape.com](mailto:sales@mashape.com).
+https://konghq.com/kong-enterprise-edition/ or contact us at
+[sales@konghq.com](mailto:sales@konghq.com).
 
 [Back to TOC](#table-of-contents)
 
@@ -51,11 +52,11 @@ https://www.mashape.com/enterprise/ or contact us at
 There are several channels where you can get answers from the community
 or the maintainers of this project:
 
-- The mailing list, hosted on the [konglayer Google
-  Group](https://groups.google.com/forum/#!forum/konglayer) for asynchronous
-  and lengthy chatter
+- Our public forum, [Kong Nation](https://discuss.konghq.com/), for
+  asynchronous and lengthy chatter and staying up-to-date with the latest
+  announcements or usage tips
 - Gitter, for faster, but more ephemeral conversations. The room is
-  hosted at https://gitter.im/Mashape/kong
+  hosted at https://gitter.im/Kong/kong
 - The IRC channel, registered on freenode as [#kong
   ](https://webchat.freenode.net/?channels=kong)
 
@@ -68,7 +69,7 @@ more than willing to assist you on those channels!
 
 ## Where to report bugs?
 
-Feel free to [submit an issue](https://github.com/Mashape/kong/issues/new) on
+Feel free to [submit an issue](https://github.com/Kong/kong/issues/new) on
 the GitHub repository, we would be grateful to hear about it! Please make sure
 to respect the GitHub issue template, and include:
 
@@ -111,7 +112,7 @@ The documentation hosted at https://getkong.org is open source and built with
 (correct typos, add examples or clarifications...)!
 
 The repository is also hosted on GitHub at:
-https://github.com/Mashape/getkong.org/
+https://github.com/Kong/getkong.org/
 
 To run and test your changes locally, follow the installation instructions in
 its README.md. You will need Ruby, Node.js (for npm), and Python 2.7 on your
@@ -127,7 +128,7 @@ When contributing, be weary of a few things:
   When proposing a change in this part of the documentation, consider proposing
   it for older versions as well.
   Example: if you fix a typo in `app/docs/0.10.x/configuration.md`, this typo
-  may also be present in `app/docs/0.9.x/configuraiton.md`.
+  may also be present in `app/docs/0.9.x/configuration.md`.
 
 [Back to TOC](#table-of-contents)
 
@@ -149,14 +150,8 @@ how to do so is the [Distribution
 Section](https://getkong.org/docs/latest/plugin-development/distribution/#distribute-your-plugin)
 of the Plugin Development Guide.
 
-To give visibility to your plugin, we advise that you post an announcement
-thread on the [mailing
-list](https://groups.google.com/forum/#!forum/konglayer). A good title for such
-an announcement would be something like:
-
-```
-[ANN] Community Plugin - [plugin name] [plugin version]
-```
+To give visibility to your plugin, we advise that you create a post in the
+Announcements category of [Kong Nation](https://discuss.konghq.com/)!
 
 In the foreseeable future, we will also include a "Community Plugins" section
 to the online [Plugins Gallery](https://getkong.org/plugins/), and we will
@@ -192,18 +187,20 @@ to verify a few things:
 - Do not update CHANGELOG.md yourself. Your change will be included there in
   due time if it is accepted, no worries!
 
-If the above guidelines are respected, your Pull Requests has all its chances
+If the above guidelines are respected, your Pull Request has all its chances
 to be considered and will be reviewed by a maintainer.
 
 If you are asked to update your patch by a reviewer, please do so! Remember:
 **you are responsible for pushing your patch forward**. If you contributed it,
-you probably are the one in need of it. You must be prepared to apply changes
+you are probably the one in need of it. You must be prepared to apply changes
 to it if necessary.
 
 If your Pull Request was accepted, congratulations! You are now an official
-contributor of Kong. Your change will be included in the subsequent release
-Changelog, and we will not forget to include your name if you are an external
-contributor. :wink:
+contributor of Kong. Get in touch with us to receive your very own
+[Contributor T-shirt](#contributor-t-shirt)!
+
+Your change will be included in the subsequent release Changelog, and we will
+not forget to include your name if you are an external contributor. :wink:
 
 [Back to TOC](#table-of-contents)
 
@@ -292,8 +289,9 @@ accepted types are:
 - **perf**: A code change that significantly improves performance
 - **refactor**: A code change that neither fixes a bug nor adds a feature, and
   is too big to be considered just `perf`
-- **chore**: Changes related to the build process, the dependencies, or
-  auxiliary tools and libraries such as LuaRocks, Travis-ci, etc...
+- **chore**: Maintenance changes related to code cleaning that isn't
+  considered part of a refactor, build process updates, dependency bumps, or
+  auxiliary tools and libraries updates (LuaRocks, Travis-ci, etc...).
 
 
 ##### Scope
@@ -408,7 +406,7 @@ suite.
 - `spec/02-integration` contains tests that start Kong (connected to a running
   database), execute Admin API and proxy requests against it, and verify the
   output
-- `spec/03-plugis` contains tests (both unit and integration) for the bundled
+- `spec/03-plugins` contains tests (both unit and integration) for the bundled
   plugins (those plugins still live in the core repository as of now, but will
   eventually be externalized)
 
@@ -447,7 +445,7 @@ assert.same(t1, t2)
 
 #### Writing performant code
 
-We write code for the [LuaJIT](https://github.com/Mashape/kong/issues/new)
+We write code for the [LuaJIT](https://github.com/Kong/kong/issues/new)
 interpreter, **not** Lua-PUC. As such, you should follow the LuaJIT best
 practices:
 
@@ -508,9 +506,24 @@ practices:
   ```
 
 And finally, most importantly: use your best judgement to design an
-efficient algorithm. Doing so will always be more performant than a poorly
-design algorithms, even following all the performance tricks of the language
-you are using. :smile:
+efficient algorithm. Doing so will always be more performant than a
+poorly-designed algorithm, even following all the performance tricks of the
+language you are using. :smile:
+
+[Back to TOC](#table-of-contents)
+
+
+### Contributor T-shirt
+
+If your Pull Request to [Kong/kong](https://github.com/Kong/kong) was accepted,
+congratulations, you are eligible to receive the very special Contributor
+T-shirt! Go ahead and fill-out the [Contributors Submissions
+form](https://goo.gl/forms/5w6mxLaE4tz2YM0L2).
+
+Proudly wear your T-shirt and show it to us by tagging
+[@thekonginc](https://twitter.com/thekonginc) on Twitter!
+
+![Kong Contributor T-shirt](https://konghq.com/wp-content/uploads/2018/04/100-contributor-t-shirt-1024x768.jpg)
 
 [Back to TOC](#table-of-contents)
 
@@ -596,19 +609,6 @@ local max_len = 100
 local MAX_LEN = 100
 ```
 
-When assigning several variables on consecutive lines, **do** align their
-assignment operator:
-
-```lua
--- bad
-local str = "world"
-local my_value = "hello"
-
--- good
-local str      = "world"
-local my_value = "hello"
-```
-
 [Back to code style TOC](#table-of-contents---code-style)
 
 
@@ -638,23 +638,6 @@ local t = {foo="hello",bar="world"}
 
 -- good
 local t = { foo = "hello", bar = "world" }
-```
-
-When using the constructor syntax on multiple lines, **do** align the
-assignments:
-
-```lua
--- bad
-local t = {
-  some_key = "hello",
-  some_other_key = "world",
-}
-
--- good
-local t = {
-  some_key       = "hello",
-  some_other_key = "world",
-}
 ```
 
 [Back to code style TOC](#table-of-contents---code-style)
@@ -786,15 +769,17 @@ if str then
 end
 ```
 
-When creating multiple branches **do** include a blank line above the `elseif`
-and `else` statements:
+When creating multiple branches that span multiple lines, **do** include a
+blank line above the `elseif` and `else` statements:
 
 ```lua
 -- bad
 if foo then
   do_stuff()
+  keep_doing_stuff()
 elseif bar then
   do_other_stuff()
+  keep_doing_other_stuff()
 else
   error()
 end
@@ -802,14 +787,31 @@ end
 -- good
 if thing then
   do_stuff()
+  keep_doing_stuff()
 
 elseif bar then
   do_other_stuff()
+  keep_doing_other_stuff()
 
 else
   error()
 end
 ```
+
+For one-line blocks, blank lines are not necessary:
+
+```lua
+--- good
+if foo then
+  do_stuff()
+else
+  error("failed!")
+end
+```
+
+Note in the correct "long" example that if some branches are long, then all
+branches are created with the preceding blank line (including the one-liner
+`else` case).
 
 When a branch returns, **do not** create subsequent branches, but write the
 rest of your logic on the parent branch:

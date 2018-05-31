@@ -2,51 +2,97 @@ local client = require "resty.websocket.client"
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
 
-pending("Websockets", function()
-  -- Pending (2017/06/16)
-  -- Since sockb.in appears to be offline, we'll need to find a way to test
-  -- WebSocket proxying support differently.
-  --  * Use another service
-  --  * Spawn our own sockb.in instance on Heroku
-  --  * Compile our test Nginx with the stream module for local testing (ideal)
+for _, strategy in helpers.each_strategy() do
+  describe("Websockets [#" .. strategy .. "]", function()
+    setup(function()
+      local bp = helpers.get_db_utils(strategy)
 
-  setup(function()
-    assert(helpers.dao.apis:insert {
-      name = "ws",
-      uris = { "/ws" },
-      strip_uri = true,
-      upstream_url = "http://sockb.in"
-    })
+      local service = bp.services:insert {
+        name = "ws",
+        path = "/ws",
+      }
 
-    assert(helpers.start_kong())
+      bp.routes:insert {
+        protocols   = { "http" },
+        paths       = { "/up-ws" },
+        service     = service,
+        strip_path  = true,
+      }
+
+      assert(helpers.start_kong({
+        database   = strategy,
+        nginx_conf = "spec/fixtures/custom_nginx.template",
+      }))
+    end)
+
+    teardown(function()
+      helpers.stop_kong()
+    end)
+
+    local function open_socket(uri)
+      local wc = assert(client:new())
+      assert(wc:connect(uri))
+      return wc
+    end
+
+    describe("text", function()
+      local function send_text_and_get_echo(uri)
+        local payload = { message = "hello websocket" }
+        local wc      = open_socket(uri)
+
+        assert(wc:send_text(cjson.encode(payload)))
+        local frame, typ, err = wc:recv_frame()
+        assert.is_nil(wc.fatal)
+        assert(frame, err)
+        assert.equal("text", typ)
+        assert.same(payload, cjson.decode(frame))
+
+        assert(wc:send_close())
+      end
+
+      it("sends and gets text without Kong", function()
+        send_text_and_get_echo("ws://127.0.0.1:15555/ws")
+      end)
+
+      it("sends and gets text with Kong", function()
+        send_text_and_get_echo("ws://" .. helpers.get_proxy_ip(false) ..
+                               ":" .. helpers.get_proxy_port(false) .. "/up-ws")
+      end)
+
+      it("sends and gets text with kong under HTTPS", function()
+        send_text_and_get_echo("wss://" .. helpers.get_proxy_ip(true) ..
+                               ":" .. helpers.get_proxy_port(true) .. "/up-ws")
+      end)
+    end)
+
+    describe("ping pong", function()
+      local function send_ping_and_get_pong(uri)
+        local payload = { message = "give me a pong" }
+        local wc      = open_socket(uri)
+
+        assert(wc:send_ping(cjson.encode(payload)))
+        local frame, typ, err = wc:recv_frame()
+        assert.is_nil(wc.fatal)
+        assert(frame, err)
+        assert.equal("pong", typ)
+        assert.same(payload, cjson.decode(frame))
+
+        assert(wc:send_close())
+      end
+
+      it("plays ping-pong without Kong", function()
+        send_ping_and_get_pong("ws://127.0.0.1:15555/ws")
+      end)
+
+      it("plays ping-pong with Kong", function()
+        send_ping_and_get_pong("ws://" .. helpers.get_proxy_ip(false) ..
+                               ":" .. helpers.get_proxy_port(false) .. "/up-ws")
+      end)
+
+      it("plays ping-pong with kong under HTTPS", function()
+        send_ping_and_get_pong("wss://" .. helpers.get_proxy_ip(true) ..
+                               ":" .. helpers.get_proxy_port(true) .. "/up-ws")
+      end)
+    end)
   end)
-
-  teardown(function()
-    helpers.stop_kong()
-  end)
-
-  local function make_request(uri)
-    local wb = assert(client:new())
-    assert(wb:connect(uri))
-    assert(wb:send_text("testing Kong"))
-
-    local data = assert(wb:recv_frame())
-    assert.equal("testing Kong", cjson.decode(data).reqData)
-
-    assert(wb:send_close())
-
-    return true
-  end
-
-  it("works without Kong", function()
-    assert(make_request("ws://sockb.in"))
-  end)
-
-  it("works with Kong", function()
-    assert(make_request("ws://" .. helpers.test_conf.proxy_ip .. ":" .. helpers.test_conf.proxy_port .. "/ws"))
-  end)
-
-  it("works with Kong under HTTPS", function()
-    assert(make_request("wss://" .. helpers.test_conf.proxy_ssl_ip .. ":" .. helpers.test_conf.proxy_ssl_port .. "/ws"))
-  end)
-end)
+end

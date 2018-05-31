@@ -1,7 +1,5 @@
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
-local serf_signals = require "kong.cmd.utils.serf_signals"
 local conf_loader = require "kong.conf_loader"
-local DAOFactory = require "kong.dao.factory"
 local pl_path = require "pl.path"
 local kill = require "kong.cmd.utils.kill"
 local log = require "kong.cmd.utils.log"
@@ -34,10 +32,9 @@ local function execute(args)
   if running then
     log.verbose("nginx is still running at %s, forcing shutdown", conf.prefix)
     assert(nginx_signals.stop(conf))
+    log("Timeout, Kong stopped forcefully")
+    return
   end
-
-  local dao = assert(DAOFactory.new(conf))
-  assert(serf_signals.stop(conf, dao))
 
   log("Kong stopped (gracefully)")
 end
@@ -54,8 +51,8 @@ If the timeout delay is reached, the node will be forcefully
 stopped (SIGTERM).
 
 Options:
- -p,--prefix   (optional string) prefix Kong is running at
- -t,--timeout  (default 10) timeout before forced shutdown
+ -p,--prefix      (optional string) prefix Kong is running at
+ -t,--timeout     (default 10) timeout before forced shutdown
 ]]
 
 return {

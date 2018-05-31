@@ -1,10 +1,11 @@
 local utils = require "kong.tools.utils"
 local singletons = require "kong.singletons"
+local public = require "kong.tools.public"
 local conf_loader = require "kong.conf_loader"
+local cjson = require "cjson"
 
 local sub = string.sub
 local find = string.find
-local pairs = pairs
 local ipairs = ipairs
 local select = select
 local tonumber = tonumber
@@ -16,7 +17,7 @@ local lua_version = jit and jit.version or _VERSION
 return {
   ["/"] = {
     GET = function(self, dao, helpers)
-      local distinct_plugins = {}
+      local distinct_plugins = setmetatable({}, cjson.empty_array_mt)
       local prng_seeds = {}
 
       do
@@ -52,10 +53,16 @@ return {
         end
       end
 
+      local node_id, err = public.get_node_id()
+      if node_id == nil then
+        ngx.log(ngx.ERR, "could not get node id: ", err)
+      end
+
       return helpers.responses.send_HTTP_OK {
         tagline = tagline,
         version = version,
         hostname = utils.get_hostname(),
+        node_id = node_id,
         timers = {
           running = ngx.timer.running_count(),
           pending = ngx.timer.pending_count()
@@ -90,15 +97,18 @@ return {
           connections_handled = tonumber(handled),
           total_requests = tonumber(total)
         },
-        database = {}
+        database = {
+          reachable = false,
+        },
       }
 
-      for k, v in pairs(dao.daos) do
-        local count, err = v:count()
-        if err then
-          return helpers.responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
-        end
-        status_response.database[k] = count
+      local ok, err = dao.db:reachable()
+      if not ok then
+        ngx.log(ngx.ERR, "failed to reach database as part of ",
+                         "/status endpoint: ", err)
+
+      else
+        status_response.database.reachable = true
       end
 
       return helpers.responses.send_HTTP_OK(status_response)

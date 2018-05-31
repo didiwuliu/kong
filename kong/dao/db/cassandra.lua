@@ -24,10 +24,12 @@ _M.dao_insert_values = {
     return uuid()
   end,
   timestamp = function()
-    -- return time in UNIT millisecond, and PRECISION millisecond 
-    return math.floor(timestamp.get_utc_ms()) 
+    -- return time in UNIT millisecond, and PRECISION millisecond
+    return math.floor(timestamp.get_utc_ms())
   end
 }
+
+_M.additional_tables = { "cluster_events", "routes", "services" }
 
 function _M.new(kong_config)
   local self = _M.super.new()
@@ -37,8 +39,15 @@ function _M.new(kong_config)
     prepared = true
   }
 
+  if not ngx.shared.kong_cassandra then
+    error("cannot use Cassandra datastore: missing shared dict "            ..
+          "'kong_cassandra' in Nginx configuration, are you using a "       ..
+          "custom template? Make sure the 'lua_shared_dict kong_cassandra " ..
+          "[SIZE];' directive is defined.")
+  end
+
   local cluster_options = {
-    shm = "cassandra",
+    shm = "kong_cassandra",
     contact_points = kong_config.cassandra_contact_points,
     default_port = kong_config.cassandra_port,
     keyspace = kong_config.cassandra_keyspace,
@@ -55,6 +64,12 @@ function _M.new(kong_config)
   if ngx.IS_CLI then
     local policy = require("resty.cassandra.policies.reconnection.const")
     cluster_options.reconn_policy = policy.new(100)
+
+    -- Force LuaSocket usage in order to allow for self-signed certificates
+    -- to be trusted (via opts.cafile) in the resty-cli interpreter.
+    -- As usual, LuaSocket is also forced in non-supported cosocket contexts.
+    local socket = require "cassandra.socket"
+    socket.force_luasocket("timer", true)
   end
 
   --
@@ -85,15 +100,6 @@ function _M.new(kong_config)
   self.query_options = query_opts
   self.cluster_options = cluster_options
 
-  if ngx.IS_CLI then
-    -- we must manually call our init phase (usually called from `init_by_lua`)
-    -- to refresh the cluster.
-    local ok, err = self:init()
-    if not ok then
-      return nil, err
-    end
-  end
-
   return self
 end
 
@@ -101,8 +107,13 @@ local function extract_major(release_version)
   return match(release_version, "^(%d+)%.%d")
 end
 
+local function extract_major_minor(release_version)
+  return match(release_version, "^(%d+%.%d+)")
+end
+
 local function cluster_release_version(peers)
-  local first_release_version
+  local major_minor_version
+  local major_version
   local mismatch
 
   for i = 1, #peers do
@@ -111,14 +122,17 @@ local function cluster_release_version(peers)
       return nil, 'no release_version for peer ' .. peers[i].host
     end
 
-    local major_version = extract_major(release_version)
-    if not major_version then
+    local peer_major_version = extract_major(release_version)
+    if not peer_major_version then
       return nil, 'failed to extract major version for peer ' .. peers[i].host ..
                   ' version: ' .. tostring(peers[i].release_version)
     end
+
     if i == 1 then
-      first_release_version = major_version
-    elseif major_version ~= first_release_version then
+      major_version = peer_major_version
+      major_minor_version = extract_major_minor(release_version)
+
+    elseif peer_major_version ~= major_version then
       mismatch = true
       break
     end
@@ -135,10 +149,14 @@ local function cluster_release_version(peers)
     return nil, concat(err_t, " ")
   end
 
-  return tonumber(first_release_version)
+  return {
+    major = major_version,
+    major_minor = major_minor_version,
+  }
 end
 
 _M.extract_major = extract_major
+_M.extract_major_minor = extract_major_minor
 _M.cluster_release_version = cluster_release_version
 
 function _M:init()
@@ -151,18 +169,23 @@ function _M:init()
   if err then return nil, err
   elseif not peers then return nil, 'no peers in shm' end
 
-  self.release_version, err = cluster_release_version(peers)
-  if not self.release_version then
+  local res, err = cluster_release_version(peers)
+  if not res then
     return nil, err
   end
+
+  self.major_version_n = tonumber(res.major)
+  self.major_minor_version = res.major_minor
 
   return true
 end
 
 function _M:infos()
   return {
+    db_name = "Cassandra",
     desc = "keyspace",
-    name = self.cluster_options.keyspace
+    name = self.cluster_options.keyspace,
+    version = self.major_minor_version or "unknown",
   }
 end
 
@@ -192,6 +215,14 @@ function _M:first_coordinator()
   return true
 end
 
+function _M:get_coordinator()
+  if not coordinator then
+    return nil, "no coordinator has been set"
+  end
+
+  return coordinator
+end
+
 function _M:coordinator_change_keyspace(keyspace)
   if not coordinator then
     return nil, "no coordinator"
@@ -215,12 +246,41 @@ function _M:close_coordinator()
   return true
 end
 
-function _M:wait_for_schema_consensus()
+function _M:check_schema_consensus()
+  local close_coordinator
+
+  if not coordinator then
+    close_coordinator = true
+
+    local peer, err = self:first_coordinator()
+    if not peer then
+      return nil, "could not retrieve coordinator: " .. err
+    end
+
+    -- coordinator = peer -- done by first_coordinator()
+  end
+
+  local ok, err = self.cluster.check_schema_consensus(coordinator)
+
+  if close_coordinator then
+    -- ignore errors
+    self:close_coordinator()
+  end
+
+  if err then
+    return nil, err
+  end
+
+  return ok
+end
+
+-- timeout is optional, defaults to `max_schema_consensus_wait` setting
+function _M:wait_for_schema_consensus(timeout)
   if not coordinator then
     return nil, "no coordinator"
   end
 
-  return self.cluster:wait_schema_consensus(coordinator)
+  return self.cluster:wait_schema_consensus(coordinator, timeout)
 end
 
 function _M:query(query, args, options, schema, no_keyspace)
@@ -255,12 +315,18 @@ end
 -- @section query_building
 
 local function serialize_arg(field, value)
-  if value == nil then
+  if value == nil or value == ngx.null then
     return cassandra.null
   elseif field.type == "id" then
     return cassandra.uuid(value)
   elseif field.type == "timestamp" then
     return cassandra.timestamp(value)
+  elseif field.type == "boolean" then
+    if type(value) == "boolean" then
+      return cassandra.boolean(value)
+    end
+
+    return cassandra.boolean(value == "true")
   elseif field.type == "table" or field.type == "array" then
     return cjson.encode(value)
   else
@@ -301,7 +367,7 @@ local function check_unique_constraints(self, table_name, constraints, values, p
 
   for col, constraint in pairs(constraints.unique) do
     -- Only check constraints if value is non-null
-    if values[col] ~= nil then
+    if values[col] ~= nil and values[col] ~= ngx.null then
       local where, args = get_where(constraint.schema, {[col] = values[col]})
       local query = select_query(table_name, where)
       local rows, err = self:query(query, args, nil, constraint.schema)
@@ -337,7 +403,7 @@ local function check_foreign_constaints(self, values, constraints)
   for col, constraint in pairs(constraints.foreign) do
     -- Only check foreign keys if value is non-null,
     -- if must not be null, field should be required
-    if values[col] ~= nil then
+    if values[col] ~= nil and values[col] ~= ngx.null then
       local res, err = self:find(constraint.table, constraint.schema, {
         [constraint.col] = values[col]
       })
@@ -624,9 +690,17 @@ end
 function _M:current_migrations()
   local q_keyspace_exists, q_migrations_table_exists
 
-  assert(self.release_version, "release_version not set for Cassandra cluster")
+  if not self.major_version_n then
+    local ok, err = self:init()
+    if not ok then
+      return nil, err
+    end
+  end
 
-  if self.release_version == 3 then
+  -- For now we will assume that a release version number of 3 and greater
+  -- will use the same schema. This is recognized as a hotfix and will be
+  -- revisited for a more considered solution at a later time.
+  if self.major_version_n >= 3 then
     q_keyspace_exists = [[
       SELECT * FROM system_schema.keyspaces
       WHERE keyspace_name = ?
@@ -696,6 +770,17 @@ function _M:record_migration(id, name)
   if not res then
     return nil, err
   end
+  return true
+end
+
+function _M:reachable()
+  local peer, err = self.cluster:next_coordinator()
+  if not peer then
+    return nil, Errors.db(err)
+  end
+
+  peer:setkeepalive()
+
   return true
 end
 

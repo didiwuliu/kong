@@ -1,4 +1,4 @@
-require("kong.core.globalpatches")({cli = true})
+require("kong.globalpatches")({cli = true})
 
 math.randomseed() -- Generate PRNG seed
 
@@ -6,8 +6,8 @@ local pl_app = require "pl.lapp"
 local log = require "kong.cmd.utils.log"
 
 local options = [[
- --v           verbose
- --vv          debug
+ --v              verbose
+ --vv             debug
 ]]
 
 local cmds_arr = {}
@@ -19,9 +19,8 @@ local cmds = {
   reload = true,
   health = true,
   check = true,
-  compile = true,
+  prepare = true,
   migrations = true,
-  cluster = true,
   version = true,
   roar = true
 }

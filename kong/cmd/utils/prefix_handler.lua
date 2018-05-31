@@ -6,92 +6,13 @@ local pl_tablex = require "pl.tablex"
 local pl_utils = require "pl.utils"
 local pl_file = require "pl.file"
 local pl_path = require "pl.path"
-local version = require "version"
 local pl_dir = require "pl.dir"
 local socket = require "socket"
 local utils = require "kong.tools.utils"
-local meta = require "kong.meta"
 local log = require "kong.cmd.utils.log"
 local constants = require "kong.constants"
+local ffi = require "ffi"
 local fmt = string.format
-
--- script from old services.serf module
-local script_template = [[
-#!/bin/sh
-
-PAYLOAD=`cat` # Read from stdin
-if [ "$SERF_EVENT" != "user" ]; then
-  PAYLOAD="{\"type\":\"${SERF_EVENT}\",\"entity\": \"${PAYLOAD}\"}"
-fi
-
-CMD="\
-local http = require 'resty.http' \
-local client = http.new() \
-client:set_timeout(5000) \
-client:connect('%s', %d) \
-client:request { \
-  method = 'POST', \
-  path = '/cluster/events/', \
-  body = [=[${PAYLOAD}]=], \
-  headers = { \
-    ['content-type'] = 'application/json' \
-  } \
-}"
-
-%s -e "$CMD"
-]]
-
-local resty_bin_name = "resty"
-local resty_version_pattern = "nginx[^\n]-openresty[^\n]-([%d%.]+)"
-local resty_compatible = version.set(unpack(meta._DEPENDENCIES.nginx))
-local resty_search_paths = {
-  "/usr/local/openresty/bin",
-  ""
-}
-
-local function is_openresty(bin_path)
-  local cmd = fmt("%s -V", bin_path)
-  local ok, _, _, stderr = pl_utils.executeex(cmd)
-  local lines = pl_stringx.splitlines(stderr)
-  if #lines > 1 then
-    stderr = lines[2] -- show openresty version line
-  else
-    stderr = lines[1] -- strip trailing line jump
-  end
-  log.debug("%s: '%s'", cmd, stderr)
-  if ok and stderr then
-    local version_match = stderr:match(resty_version_pattern)
-    if not version_match or not resty_compatible:matches(version_match) then
-      log.verbose("'resty' found at %s uses incompatible OpenResty. Kong " ..
-                  "requires OpenResty version %s, got %s", bin_path,
-                  tostring(resty_compatible), version_match)
-      return false
-    end
-    return true
-  end
-  log.debug("OpenResty 'resty' executable not found at %s", bin_path)
-end
-
-local function find_resty_bin()
-  log.debug("searching for OpenResty 'resty' executable")
-
-  local found
-  for _, path in ipairs(resty_search_paths) do
-    local path_to_check = pl_path.join(path, resty_bin_name)
-    if is_openresty(path_to_check) then
-      found = path_to_check
-      log.debug("found OpenResty 'resty' executable at %s", found)
-      break
-    end
-  end
-
-  if not found then
-    return nil, ("could not find OpenResty 'resty' executable. Kong requires" ..
-                 " version %s"):format(tostring(resty_compatible))
-  end
-
-  return found
-end
 
 local function gen_default_ssl_cert(kong_config, admin)
   -- create SSL folder
@@ -152,7 +73,7 @@ local function get_ulimit()
   end
 end
 
-local function gather_system_infos(compile_env)
+local function gather_system_infos()
   local infos = {}
 
   local ulimit, err = get_ulimit()
@@ -189,11 +110,45 @@ local function compile_conf(kong_config, conf_template)
   compile_env = pl_tablex.merge(compile_env, kong_config, true) -- union
   compile_env.dns_resolver = table.concat(compile_env.dns_resolver, " ")
 
-  local post_template = pl_template.substitute(conf_template, compile_env)
+  local post_template, err = pl_template.substitute(conf_template, compile_env)
+  if not post_template then
+    return nil, "failed to compile nginx config template: " .. err
+  end
+
   return string.gsub(post_template, "(${%b{}})", function(w)
     local name = w:sub(4, -3)
     return compile_env[name:lower()] or ""
   end)
+end
+
+local function write_env_file(path, data)
+  local c = require "lua_system_constants"
+
+  local flags = bit.bor(c.O_CREAT(), c.O_WRONLY())
+  local mode  = bit.bor(c.S_IRUSR(), c.S_IWUSR(), c.S_IRGRP())
+
+  local fd = ffi.C.open(path, flags, mode)
+  if fd < 0 then
+    local errno = ffi.errno()
+    return nil, "unable to open env path " .. path .. " (" ..
+                ffi.string(ffi.C.strerror(errno)) .. ")"
+  end
+
+  local n  = #data
+  local sz = ffi.C.write(fd, data, n)
+  if sz ~= n then
+    ffi.C.close(fd)
+    return nil, "wrote " .. sz .. " bytes, expected to write " .. n
+  end
+
+  local ok = ffi.C.close(fd)
+  if ok ~= 0 then
+    local errno = ffi.errno()
+    return nil, "failed to close fd (" ..
+                ffi.string(ffi.C.strerror(errno)) .. ")"
+  end
+
+  return true
 end
 
 local function compile_kong_conf(kong_config)
@@ -219,7 +174,7 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
   end
 
   -- create directories in prefix
-  for _, dir in ipairs {"logs", "serf", "pids"} do
+  for _, dir in ipairs {"logs", "pids"} do
     local ok, err = pl_dir.makepath(pl_path.join(kong_config.prefix, dir))
     if not ok then
       return nil, err
@@ -246,33 +201,9 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
     end
   end
 
-  log.verbose("saving serf identifier to %s", kong_config.serf_node_id)
-  if not pl_path.exists(kong_config.serf_node_id) then
-    local id = utils.get_hostname() .. "_" .. kong_config.cluster_listen .. "_" .. utils.random_string()
-    pl_file.write(kong_config.serf_node_id, id)
-  end
-
-  local resty_bin, err = find_resty_bin()
-  if not resty_bin then
-    return nil, err
-  end
-
-  log.verbose("saving serf shell script handler to %s", kong_config.serf_event)
-  -- setting serf admin ip
-  local admin_ip = kong_config.admin_ip
-  if kong_config.admin_ip == "0.0.0.0" then
-    admin_ip = "127.0.0.1"
-  end
-  -- saving serf script handler
-  local script = fmt(script_template, admin_ip, kong_config.admin_port, resty_bin)
-  pl_file.write(kong_config.serf_event, script)
-  local ok, _, _, stderr = pl_utils.executeex("chmod +x " .. kong_config.serf_event)
-  if not ok then
-    return nil, stderr
-  end
-
   -- generate default SSL certs if needed
-  if kong_config.ssl and not kong_config.ssl_cert and not kong_config.ssl_cert_key then
+  if kong_config.proxy_ssl_enabled and not kong_config.ssl_cert and
+     not kong_config.ssl_cert_key then
     log.verbose("SSL enabled, no custom certificate set: using default certificate")
     local ok, err = gen_default_ssl_cert(kong_config)
     if not ok then
@@ -281,7 +212,8 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
     kong_config.ssl_cert = kong_config.ssl_cert_default
     kong_config.ssl_cert_key = kong_config.ssl_cert_key_default
   end
-  if kong_config.admin_ssl and not kong_config.admin_ssl_cert and not kong_config.admin_ssl_cert_key then
+  if kong_config.admin_ssl_enabled and not kong_config.admin_ssl_cert and
+     not kong_config.admin_ssl_cert_key then
     log.verbose("Admin SSL enabled, no custom certificate set: using default certificate")
     local ok, err = gen_default_ssl_cert(kong_config, true)
     if not ok then
@@ -336,19 +268,22 @@ local function prepare_prefix(kong_config, nginx_custom_template_path)
 
   for k, v in pairs(kong_config) do
     if type(v) == "table" then
-      v = table.concat(v, ",")
+      if (getmetatable(v) or {}).__tostring then
+        -- the 'tostring' meta-method knows how to serialize
+        v = tostring(v)
+      else
+        v = table.concat(v, ",")
+      end
     end
     if v ~= "" then
       buf[#buf+1] = k .. " = " .. tostring(v)
     end
   end
 
-  pl_file.write(kong_config.kong_env, table.concat(buf, "\n"))
-
-  -- ... yeah this sucks. thanks fwrite.
-  local ok, _, _, err = pl_utils.executeex("chmod 640 " .. kong_config.kong_env)
+  local ok, err = write_env_file(kong_config.kong_env,
+                                 table.concat(buf, "\n") .. "\n")
   if not ok then
-    log.warn("Unable to set kong env permissions: ", err)
+    return nil, err
   end
 
   return true

@@ -1,4 +1,4 @@
-local pgmoon = require "pgmoon-mashape"
+local pgmoon = require "pgmoon"
 local Errors = require "kong.dao.errors"
 local utils = require "kong.tools.utils"
 local cjson = require "cjson"
@@ -26,13 +26,22 @@ end
 
 local _M = require("kong.dao.db").new_db("postgres")
 
+-- force the use of luasocket for pgmoon connections where
+-- lua-nginx-module's socket interface is unavailable. pgmoon handles the
+-- master init phase on its own, but we need some extra logic wrapping
+-- keepalive et al, so we explicitly declare socket_type for init as well
+local forced_luasocket_phases = {
+  init        = true,
+  init_worker = true,
+}
+
 _M.dao_insert_values = {
   id = function()
     return uuid()
   end
 }
 
-_M.additional_tables = {"ttls"}
+_M.additional_tables = { "ttls", "cluster_events", "routes", "services" }
 
 function _M.new(kong_config)
   local self = _M.super.new()
@@ -51,14 +60,54 @@ function _M.new(kong_config)
   return self
 end
 
+local function query_opts(self)
+  local opts = self:clone_query_options()
+
+  if ngx.IS_CLI or forced_luasocket_phases[get_phase()] then
+    -- Force LuaSocket usage in order to allow for self-signed certificates
+    -- to be trusted (via opts.cafile) in the resty-cli interpreter.
+    -- As usual, LuaSocket is also forced in non-supported cosocket contexts.
+    opts.socket_type = "luasocket"
+
+  else
+    opts.socket_type = "nginx"
+  end
+
+  return opts
+end
+
 function _M:infos()
   return {
+    db_name = "PostgreSQL",
     desc = "database",
-    name = self:clone_query_options().database
+    name = self:clone_query_options().database,
+    version = self.major_minor_version or "unknown",
   }
 end
 
 local do_clean_ttl
+
+function _M.extract_major_minor(release_version)
+  return match(release_version, "^(%d+%.%d+)")
+end
+
+function _M:init()
+  local res, err = self:query("SHOW server_version;")
+  if not res then
+    return nil, Errors.db("could not retrieve server_version: " .. err)
+  end
+
+  if #res < 1 or not res[1].server_version then
+    return nil, Errors.db("could not retrieve server_version")
+  end
+
+  self.major_minor_version = _M.extract_major_minor(res[1].server_version)
+  if not self.major_minor_version then
+    return nil, Errors.db("could not extract major.minor version")
+  end
+
+  return true
+end
 
 function _M:init_worker()
   local ok, err = timer_at(TTL_CLEANUP_INTERVAL, do_clean_ttl, self)
@@ -188,6 +237,10 @@ end
 
 -- @see pgmoon
 local function escape_literal(val, field)
+  if val == ngx.null then
+    return "NULL"
+  end
+
   local t_val = type(val)
   if t_val == "number" then
     return tostring(val)
@@ -290,7 +343,7 @@ local function deserialize_rows(rows, schema)
 end
 
 function _M:query(query, schema)
-  local conn_opts = self:clone_query_options()
+  local conn_opts = query_opts(self)
   local pg = pgmoon.new(conn_opts)
   local ok, err = pg:connect()
   if not ok then
@@ -298,7 +351,7 @@ function _M:query(query, schema)
   end
 
   local res, err = pg:query(query)
-  if get_phase() ~= "init" then
+  if conn_opts.socket_type == "nginx" then
     pg:keepalive()
   else
     pg:disconnect()
@@ -317,7 +370,7 @@ local function deserialize_timestamps(self, row, schema)
   for k, v in pairs(schema.fields) do
     if v.type == "timestamp" and result[k] then
       local query = fmt([[
-        SELECT (extract(epoch from timestamp '%s')*1000)::bigint as %s;
+        SELECT (extract(epoch from timestamp '%s') * 1000) as %s;
       ]], result[k], k)
       local res, err = self:query(query)
       if not res then return nil, err
@@ -334,8 +387,8 @@ local function serialize_timestamps(self, tbl, schema)
   for k, v in pairs(schema.fields) do
     if v.type == "timestamp" and result[k] then
       local query = fmt([[
-        SELECT to_timestamp(%d/1000) at time zone 'UTC' as %s;
-      ]], result[k], k)
+        SELECT to_timestamp(%f) at time zone 'UTC' as %s;
+      ]], result[k] / 1000, k)
       local res, err = self:query(query)
       if not res then return nil, err
       elseif #res <= 1 then
@@ -553,6 +606,20 @@ function _M:record_migration(id, name)
   if not res then
     return nil, err
   end
+  return true
+end
+
+function _M:reachable()
+  local conn_opts = query_opts(self)
+  local pg = pgmoon.new(conn_opts)
+
+  local ok, err = pg:connect()
+  if not ok then
+    return nil, Errors.db(err)
+  end
+
+  pg:keepalive()
+
   return true
 end
 

@@ -1,12 +1,16 @@
 local DAO = require "kong.dao.dao"
+local log = require "kong.cmd.utils.log"
 local utils = require "kong.tools.utils"
+local version = require "version"
+local constants = require "kong.constants"
 local ModelFactory = require "kong.dao.model_factory"
+
+local fmt = string.format
 
 local CORE_MODELS = {
   "apis",
   "consumers",
   "plugins",
-  "nodes",
   "ssl_certificates",
   "ssl_servers_names",
   "upstreams",
@@ -60,7 +64,7 @@ local function build_constraints(schemas)
   return all_constraints
 end
 
-local function load_daos(self, schemas, constraints, events_handler)
+local function load_daos(self, schemas, constraints)
   for m_name, schema in pairs(schemas) do
     if constraints[m_name] ~= nil and constraints[m_name].foreign ~= nil then
       for col, f_constraint in pairs(constraints[m_name].foreign) do
@@ -81,11 +85,12 @@ local function load_daos(self, schemas, constraints, events_handler)
   end
 
   for m_name, schema in pairs(schemas) do
-    self.daos[m_name] = DAO(self.db, ModelFactory(schema), schema, constraints[m_name], events_handler)
+    self.daos[m_name] = DAO(self.db, ModelFactory(schema), schema,
+                            constraints[m_name])
   end
 end
 
-function _M.new(kong_config, events_handler)
+function _M.new(kong_config, new_db)
   local self = {
     db_type = kong_config.database,
     daos = {},
@@ -100,6 +105,7 @@ function _M.new(kong_config, events_handler)
     return ret_error_string(self.db_type, nil, err)
   end
 
+  db.new_db = new_db
   self.db = db
 
   local schemas = {}
@@ -123,17 +129,65 @@ function _M.new(kong_config, events_handler)
   end
 
   local constraints = build_constraints(schemas)
-  load_daos(self, schemas, constraints, events_handler)
+  load_daos(self, schemas, constraints)
 
   return setmetatable(self, _M)
 end
 
+function _M:check_version_compat(min, deprecated)
+  local db_infos = self:infos()
+  if db_infos.version == "unknown" then
+    return nil, "could not check database compatibility: version " ..
+                "is unknown (did you call ':init'?)"
+  end
+
+  local db_v = version.version(db_infos.version)
+  local min_v = version.version(min)
+
+  if db_v < min_v then
+    if deprecated then
+      local depr_v = version.version(deprecated)
+
+      if db_v >= depr_v then
+        log.warn("Currently using %s %s which is considered deprecated, " ..
+                 "please use %s or greater", db_infos.db_name,
+                 db_infos.version, min)
+
+        return true
+      end
+    end
+
+    return nil, fmt("Kong requires %s %s or greater (currently using %s)",
+                    db_infos.db_name, min, db_infos.version)
+  end
+
+  return true
+end
+
 function _M:init()
-  return self.db:init()
+  local ok, err = self.db:init()
+  if not ok then
+    return ret_error_string(self.db_type, nil, err)
+  end
+
+  local db_constants = constants.DATABASE[self.db_type:upper()]
+
+  ok, err = self:check_version_compat(db_constants.MIN, db_constants.DEPRECATED)
+  if not ok then
+    return ret_error_string(self.db_type, nil, err)
+  end
+
+  return true
 end
 
 function _M:init_worker()
   return self.db:init_worker()
+end
+
+function _M:set_events_handler(events)
+  for _, dao in pairs(self.daos) do
+    dao.events = events
+  end
 end
 
 -- Migrations
@@ -196,6 +250,37 @@ function _M:migrations_modules()
     end
   end
 
+  do
+    -- check that migrations have a name, and that no two migrations have the
+    -- same name.
+    local migration_names = {}
+
+    for plugin_name, plugin_migrations in pairs(migrations) do
+      for i, migration in ipairs(plugin_migrations) do
+        local s = plugin_name == "core" and
+                    "'core'" or "plugin '" .. plugin_name .. "'"
+
+        if migration.name == nil then
+          return nil, string.format("migration '%d' for %s has no " ..
+                                    "name", i, s)
+        end
+
+        if type(migration.name) ~= "string" then
+          return nil, string.format("migration '%d' for %s must be a string",
+                                    i, s)
+        end
+
+        if migration_names[migration.name] then
+          return nil, string.format("migration '%s' (%s) already " ..
+                                    "exists; migrations must have unique names",
+                                    migration.name, s)
+        end
+
+        migration_names[migration.name] = true
+      end
+    end
+  end
+
   return migrations
 end
 
@@ -214,10 +299,14 @@ end
 
 local function migrate(self, identifier, migrations_modules, cur_migrations, on_migrate, on_success)
   local migrations = migrations_modules[identifier]
-  local recorded = cur_migrations[identifier] or {}
+  local recorded = {}
+  for _, name in ipairs(cur_migrations[identifier] or {}) do
+    recorded[name] = true
+  end
+
   local to_run = {}
-  for i, mig in ipairs(migrations) do
-    if mig.name ~= recorded[i] then
+  for _, mig in ipairs(migrations) do
+    if not recorded[mig.name] then
       to_run[#to_run + 1] = mig
     end
   end
@@ -255,22 +344,73 @@ local function migrate(self, identifier, migrations_modules, cur_migrations, on_
 end
 
 local function default_on_migrate(identifier, db_infos)
-  local log = require "kong.cmd.utils.log"
   log("migrating %s for %s %s",
       identifier, db_infos.desc, db_infos.name)
 end
 
 local function default_on_success(identifier, migration_name, db_infos)
-  local log = require "kong.cmd.utils.log"
   log("%s migrated up to: %s",
       identifier, migration_name)
+end
+
+function _M:are_migrations_uptodate()
+  local migrations_modules, err = self:migrations_modules()
+  if not migrations_modules then
+    return ret_error_string(self.db.name, nil, err)
+  end
+
+  local cur_migrations, err = self:current_migrations()
+  if err then
+    return ret_error_string(self.db.name, nil,
+                            "could not retrieve current migrations: " .. err)
+  end
+
+  for module, migrations in pairs(migrations_modules) do
+    for _, migration in ipairs(migrations) do
+      if not (cur_migrations[module] and
+              utils.table_contains(cur_migrations[module], migration.name))
+      then
+        local infos = self.db:infos()
+        log.warn("%s %s '%s' is missing migration: (%s) %s",
+                 self.db_type, infos.desc, infos.name, module, migration.name or "(no name)")
+        return ret_error_string(self.db.name, nil, "the current database "   ..
+                                "schema does not match this version of "     ..
+                                "Kong. Please run `kong migrations up` "     ..
+                                "to update/initialize the database schema. " ..
+                                "Be aware that Kong migrations should only " ..
+                                "run from a single node, and that nodes "    ..
+                                "running migrations concurrently will "      ..
+                                "conflict with each other and might "        ..
+                                "corrupt your database schema!")
+      end
+    end
+  end
+
+  return true
+end
+
+function _M:check_schema_consensus()
+  if self.db.name ~= "cassandra" then
+    return true -- only applicable for cassandra
+  end
+
+  log.verbose("checking Cassandra schema consensus...")
+
+  local ok, err = self.db:check_schema_consensus()
+  if err then
+    return ret_error_string(self.db.name, nil,
+                            "failed to check for schema consensus: " .. err)
+  end
+
+  log.verbose("Cassandra schema consensus: %s",
+              ok ~= nil and "reached" or "not reached")
+
+  return ok
 end
 
 function _M:run_migrations(on_migrate, on_success)
   on_migrate = on_migrate or default_on_migrate
   on_success = on_success or default_on_success
-
-  local log = require "kong.cmd.utils.log"
 
   log.verbose("running datastore migrations")
 
@@ -282,11 +422,15 @@ function _M:run_migrations(on_migrate, on_success)
     end
   end
 
-  local migrations_modules = self:migrations_modules()
+  local migrations_modules, err = self:migrations_modules()
+  if not migrations_modules then
+    return ret_error_string(self.db.name, nil, err)
+  end
+
   local cur_migrations, err = self:current_migrations()
   if err then
     return ret_error_string(self.db.name, nil,
-                            "could not get current migrations: " .. err)
+                            "could not retrieve current migrations: " .. err)
   end
 
   local ok, err, migrations_ran = migrate(self, "core", migrations_modules, cur_migrations, on_migrate, on_success)
@@ -304,27 +448,29 @@ function _M:run_migrations(on_migrate, on_success)
     end
   end
 
-  if self.db.name == "cassandra" then
-    if migrations_ran > 0 then
-      log.verbose("now waiting for schema consensus (%dms) timeout",
-                  self.db.cluster.max_schema_consensus_wait)
+  if migrations_ran > 0 then
+    log("%d migrations ran", migrations_ran)
+
+    if self.db.name == "cassandra" then
+      log("waiting for Cassandra schema consensus (%dms timeout)...",
+          self.db.cluster.max_schema_consensus_wait)
 
       local ok, err = self.db:wait_for_schema_consensus()
       if not ok then
         return ret_error_string(self.db.name, nil,
-                                "failed waiting for schema consensus: " .. err)
+                                "failed to wait for schema consensus: " .. err)
       end
-    end
 
-    ok, err = self.db:close_coordinator()
+      log("Cassandra schema consensus: reached")
+    end
+  end
+
+  if self.db.name == "cassandra" then
+    local ok, err = self.db:close_coordinator()
     if not ok then
       return ret_error_string(self.db.name, nil,
                               "could not close coordinator: " .. err)
     end
-  end
-
-  if migrations_ran > 0 then
-    log("%d migrations ran", migrations_ran)
   end
 
   log.verbose("migrations up to date")
